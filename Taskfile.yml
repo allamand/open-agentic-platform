@@ -35,6 +35,11 @@ vars:
     sh: yq -r '.hub.clusterName' {{.CONFIG_FILE}}
   DOMAIN:
     sh: yq -r '.domain' {{.CONFIG_FILE}}
+  # Passed straight through to the platform, which treats it as: the consumer
+  # terminates TLS upstream, so serve plain HTTP at the load balancer. Whatever sets
+  # this owns the upstream TLS. See workshop/ for the CloudFront case.
+  INSECURE:
+    sh: yq -r '.insecure // false' {{.CONFIG_FILE}}
   RESOURCE_PREFIX:
     sh: yq -r '.resourcePrefix' {{.CONFIG_FILE}}
   INGRESS_NAME:
@@ -111,6 +116,7 @@ tasks:
           accountId: "{{.AWS_ACCOUNT_ID}}"
           profile: "{{.AWS_PROFILE}}"
         domain: "{{.DOMAIN}}"
+        insecure: {{.INSECURE}}
         resourcePrefix: "{{.RESOURCE_PREFIX}}"
         identityCenter:
           instanceArn: "{{.IDC_INSTANCE_ARN}}"
@@ -337,7 +343,7 @@ tasks:
   # ─── Ingress / Domain Post-Install ───────────────────────────────────────────
 
   ingress:post-install:
-    desc: Post-install ingress setup — updates CloudFront origin or validates custom domain DNS
+    desc: Post-install ingress setup — point DNS at the platform ALB (custom domain only)
     cmds:
       - |
         DOMAIN="{{.DOMAIN}}"
@@ -346,11 +352,12 @@ tasks:
           exit 0
         fi
 
-        # Derive TLS mode from domain name
-        if echo "$DOMAIN" | grep -q "cloudfront.net"; then
-          TLS_MODE="cloudfront"
-        else
-          TLS_MODE="alb"
+        # insecure means the consumer terminates TLS upstream and owns whatever sits in
+        # front of the load balancer, including its origin configuration. There is
+        # nothing for OAP to do here in that case.
+        if [ "{{.INSECURE}}" = "true" ]; then
+          printf '✓ insecure mode: TLS and the ALB origin are owned upstream. Nothing to do.\n'
+          exit 0
         fi
 
         # Discover the ALB DNS name (created by LBC from grouped ingresses)
@@ -375,53 +382,15 @@ tasks:
 
         printf '▸ ALB discovered: %s\n' "$ALB_DNS"
 
-        # ── CloudFront mode (domain is *.cloudfront.net) ──
-        if [ "$TLS_MODE" = "cloudfront" ]; then
-          DIST_ID=$(aws cloudfront list-distributions \
-            --query "DistributionList.Items[?DomainName=='${DOMAIN}'].Id" \
-            --output text)
-
-          if [ -z "$DIST_ID" ] || [ "$DIST_ID" = "None" ]; then
-            printf '⚠ Could not find CloudFront distribution for %s. Skipping origin update.\n' "$DOMAIN"
-            exit 0
-          fi
-
-          CURRENT_ORIGIN=$(aws cloudfront get-distribution-config --id "$DIST_ID" \
-            --query "DistributionConfig.Origins.Items[0].DomainName" --output text)
-
-          if [ "$CURRENT_ORIGIN" = "$ALB_DNS" ]; then
-            printf '✓ CloudFront origin already points to %s\n' "$ALB_DNS"
-            exit 0
-          fi
-
-          printf '▸ Updating CloudFront %s origin: %s → %s\n' "$DIST_ID" "$CURRENT_ORIGIN" "$ALB_DNS"
-
-          ETAG=$(aws cloudfront get-distribution-config --id "$DIST_ID" --query "ETag" --output text)
-          aws cloudfront get-distribution-config --id "$DIST_ID" --query "DistributionConfig" > /tmp/cf-dist-config.json
-
-          jq --arg domain "$ALB_DNS" '.Origins.Items[0].DomainName = $domain' \
-            /tmp/cf-dist-config.json > /tmp/cf-dist-config-updated.json
-
-          aws cloudfront update-distribution \
-            --id "$DIST_ID" \
-            --if-match "$ETAG" \
-            --distribution-config file:///tmp/cf-dist-config-updated.json > /dev/null
-
-          rm -f /tmp/cf-dist-config.json /tmp/cf-dist-config-updated.json
-          printf '✓ CloudFront origin updated to %s (deployment in progress)\n' "$ALB_DNS"
-
-        # ── ALB mode (custom domain, ACM cert expected) ──
+        printf '▸ Custom domain: %s\n' "$DOMAIN"
+        printf '  ALB DNS: %s\n' "$ALB_DNS"
+        RESOLVED=$(dig +short "$DOMAIN" 2>/dev/null | head -1 || echo "")
+        if [ -z "$RESOLVED" ]; then
+          printf '⚠ Domain %s does not resolve yet.\n' "$DOMAIN"
+          printf '  Create a DNS record (CNAME or Route53 alias) pointing to:\n'
+          printf '    %s\n' "$ALB_DNS"
         else
-          printf '▸ Custom domain: %s\n' "$DOMAIN"
-          printf '  ALB DNS: %s\n' "$ALB_DNS"
-          RESOLVED=$(dig +short "$DOMAIN" 2>/dev/null | head -1 || echo "")
-          if [ -z "$RESOLVED" ]; then
-            printf '⚠ Domain %s does not resolve yet.\n' "$DOMAIN"
-            printf '  Create a DNS record (CNAME or Route53 alias) pointing to:\n'
-            printf '    %s\n' "$ALB_DNS"
-          else
-            printf '✓ Domain %s resolves to %s\n' "$DOMAIN" "$RESOLVED"
-          fi
+          printf '✓ Domain %s resolves to %s\n' "$DOMAIN" "$RESOLVED"
         fi
 
   # ─── Utilities ──────────────────────────────────────────────────────────────
