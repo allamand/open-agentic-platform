@@ -86,16 +86,27 @@ tasks:
   # ─── Platform (appmod-blueprints) ───────────────────────────────────────────
 
   platform:clone:
-    desc: Clone or update the base platform repo
+    desc: Clone or update the base platform repo to the configured ref
     cmds:
+      # No `status:` guard here. Guarding on the directory existing would skip this
+      # task once the clone is present, which silently pins the checkout to whatever
+      # ref it was first cloned at and makes changing platform.ref a no-op.
+      #
+      # The clone is --single-branch, so its refspec only tracks the original branch
+      # and a bare `git fetch origin` will not retrieve a different one. Fetch the
+      # configured ref explicitly into a remote-tracking branch.
       - |
+        set -e
         if [ -d "{{.PLATFORM_DIR}}/.git" ]; then
-          cd {{.PLATFORM_DIR}} && git fetch origin && git checkout {{.PLATFORM_REF}} && git pull origin {{.PLATFORM_REF}} 2>/dev/null || true
+          cd {{.PLATFORM_DIR}}
+          git fetch --quiet origin "+refs/heads/{{.PLATFORM_REF}}:refs/remotes/origin/{{.PLATFORM_REF}}"
+          git checkout --quiet "{{.PLATFORM_REF}}" 2>/dev/null \
+            || git checkout --quiet -b "{{.PLATFORM_REF}}" "origin/{{.PLATFORM_REF}}"
+          git merge --ff-only --quiet "origin/{{.PLATFORM_REF}}" 2>/dev/null || true
         else
-          git clone --branch {{.PLATFORM_REF}} --single-branch {{.PLATFORM_REPO}} {{.PLATFORM_DIR}}
+          git clone --quiet --branch {{.PLATFORM_REF}} --single-branch {{.PLATFORM_REPO}} {{.PLATFORM_DIR}}
         fi
-    status:
-      - test -d "{{.PLATFORM_DIR}}/.git"
+        printf '✓ platform %s @ %s\n' "{{.PLATFORM_REF}}" "$(git -C "{{.ROOT_DIR}}/{{.PLATFORM_DIR}}" rev-parse --short HEAD 2>/dev/null || git rev-parse --short HEAD)"
 
   platform:configure:
     desc: Generate platform config.local.yaml from agentic config
