@@ -1,0 +1,23 @@
+# Fleet member: oap-dev
+#
+# Registers the cluster with ArgoCD. The platform's git generator scans
+# fleet/members/*/values.yaml and mints an ArgoCD cluster secret from this file;
+# every addon ApplicationSet then fans out across those secrets.
+#
+# Registration is separate from provisioning. This file only registers. The cluster
+# itself is declared in
+# fleet/spoke-values/tenants/default/crossplane-clusters/values.yaml, and the
+# Crossplane composition observes-and-updates the secret this creates to add
+# vpcId / subnet / security-group annotations once the VPC exists.
+clusterName: oap-dev
+labels:
+  # Selects the addon tier at overlays/environments/dev, where agent_platform is
+  # enabled, so this spoke receives the agentic capabilities.
+  environment: dev
+  tenant: default
+  client_provisioner: keycloak
+clients:
+  - name: agentgateway          # → clientId "agentgateway-dev"
+    type: confidential
+    flows:
+      - client_credentials
