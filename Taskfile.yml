@@ -342,14 +342,24 @@ tasks:
           --region {{.AWS_REGION}}
         printf '✓ Updated hub/config with aws_grafana_url=%s\n' "$AMG_ENDPOINT"
 
-        # Force fleet-secret ExternalSecret refresh so annotation propagates
-        kubectl --context {{.HUB_CLUSTER_NAME}} annotate externalsecret fleet-secret-hub -n argocd \
-          force-sync=$(date +%s) --overwrite
-        printf '✓ Fleet secret refresh triggered\n'
+        # Force fleet-secret ExternalSecret refresh so annotation propagates.
+        # The name is suffixed with the cluster name (e.g. fleet-secret-peeks-hub),
+        # so discover it rather than hardcoding, the same way the platform does
+        # (cluster-providers/*/Taskfile.yaml: grep -i fleet-secret | grep <hub>).
+        ES=$(kubectl --context {{.HUB_CLUSTER_NAME}} -n argocd get externalsecret -o name 2>/dev/null \
+          | grep -i fleet-secret | grep {{.HUB_CLUSTER_NAME}} | head -1 || true)
+        if [ -n "$ES" ]; then
+          kubectl --context {{.HUB_CLUSTER_NAME}} annotate "$ES" -n argocd \
+            force-sync=$(date +%s) --overwrite
+          printf '✓ Fleet secret refresh triggered (%s)\n' "$ES"
+        else
+          printf '⚠ No fleet-secret ExternalSecret found for %s — skipping refresh.\n' "{{.HUB_CLUSTER_NAME}}"
+        fi
       # Run the platform's full observability seeding (AMP creds, Grafana API key,
       # Keycloak SAML update, spoke scraper data). This populates hub/secrets with
       # the fields that grafana-admin-credentials and grafana-amp-creds ExternalSecrets need.
-      - cd {{.PLATFORM_DIR}} && task kind-crossplane:secrets-manager:seed-observability
+      # Provider-scoped: must match platform.clusterProvider, not a fixed provider.
+      - cd {{.PLATFORM_DIR}} && task {{.CLUSTER_PROVIDER}}:secrets-manager:seed-observability
 
   # ─── Ingress / Domain Post-Install ───────────────────────────────────────────
 
