@@ -1,21 +1,39 @@
 # Default tenant cluster provisioning values.
-# Consumed by the platform `clusters` ApplicationSet (matrix generator globs
-# fleet/spoke-values/tenants/*/crossplane-clusters/values.yaml). Each key becomes
-# a PlatformCluster claim → Crossplane provisions a spoke EKS cluster.
 #
-# region defaults to the hub region (the ApplicationSet injects
-# global.defaultRegion from the hub cluster secret's aws_region annotation),
-# so it is intentionally omitted here — both spokes run in the hub region.
-clusters:
-  spoke-dev:
-    clusterName: spoke-dev
-    vpcCidr: "10.1.0.0/16"
-    kubernetesVersion: "1.35"
-    autoMode: true
-    resourcePrefix: peeks
-  spoke-prod:
-    clusterName: spoke-prod
-    vpcCidr: "10.2.0.0/16"
-    kubernetesVersion: "1.35"
-    autoMode: true
-    resourcePrefix: peeks
+# Consumed by the platform `clusters` ApplicationSet (matrix generator globs
+# fleet/spoke-values/tenants/*/crossplane-clusters/values.yaml). Each key here
+# becomes a PlatformCluster claim, and Crossplane provisions a spoke EKS cluster
+# from it.
+#
+# Empty by default, so an install provisions the hub only. Spokes are opt-in.
+# This matches appmod-blueprints, which ships fleet/members/ empty with an
+# `_example` and expects a consumer to declare what they actually want.
+#
+# It was previously populated with spoke-dev (10.1.0.0/16) and spoke-prod
+# (10.2.0.0/16) pinned to `resourcePrefix: peeks`. That made two spokes, and the
+# resource prefix of one reference environment, the default for every consumer,
+# regardless of what `spokes` said in their config.local.yaml. Note that this file
+# is the GitOps source of truth for provisioning: the `spokes` map in
+# config.local.yaml drives only the imperative `task spokes:install` path, so the
+# two are independent. Declaring a spoke here is what actually creates it.
+#
+# To add a spoke, uncomment and adjust. region is intentionally omitted: the
+# ApplicationSet injects global.defaultRegion from the hub cluster secret's
+# aws_region annotation, so a spoke runs in the hub region unless overridden.
+# Each spoke also needs a fleet member so ArgoCD gets a cluster secret for it,
+# see fleet/members/_example/.
+#
+# clusters:
+#   spoke-dev:
+#     clusterName: spoke-dev
+#     vpcCidr: "10.1.0.0/16"
+#     kubernetesVersion: "1.35"
+#     autoMode: true
+#     resourcePrefix: <your-prefix>
+#   spoke-prod:
+#     clusterName: spoke-prod
+#     vpcCidr: "10.2.0.0/16"
+#     kubernetesVersion: "1.35"
+#     autoMode: true
+#     resourcePrefix: <your-prefix>
+clusters: {}
