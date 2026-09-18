@@ -17,22 +17,25 @@
 # config.local.yaml drives only the imperative `task spokes:install` path, so the
 # two are independent. Declaring a spoke here is what actually creates it.
 #
-# To add a spoke, add an entry below and a matching fleet member so ArgoCD gets a
-# cluster secret for it, see fleet/members/_example/. region is intentionally
-# omitted: the ApplicationSet injects global.defaultRegion from the hub cluster
-# secret's aws_region annotation, so a spoke runs in the hub region unless
-# overridden.
+# No spokes are provisioned via Crossplane. oap-dev is declared on the KRO path, at
+# tenants/default/kro-clusters/, because the Crossplane platform-cluster Composition
+# cannot compose on Crossplane v2 (v2.2.1 on the current hub): its six Usage bases
+# declare protection.crossplane.io/v1beta1 Usage, namespaced in v2, with no
+# namespace, so Crossplane reports "an empty namespace may not be set when a resource
+# name is provided" and aborts after ~7 of 35 resources, before the VPC or cluster
+# exist. Verified on a live hub. Tracked in #17.
 #
-# clusterName is used verbatim as the EKS cluster name. resourcePrefix is NOT
-# cosmetic: the composition builds the spoke's ACK capability policy as
-# sts:AssumeRole on arn:aws:iam::<acct>:role/<resourcePrefix>-cluster-mgmt-*, so it
-# must match the hub's prefix or the spoke cannot assume the management roles. It
-# also tags the VPC platform.gitops.io/prefix, which is what teardown tooling
-# matches on.
-clusters:
-  oap-dev:
-    clusterName: oap-dev
-    vpcCidr: "10.1.0.0/16"
-    kubernetesVersion: "1.35"
-    autoMode: true
-    resourcePrefix: peeks
+# To use this path once that is fixed, add an entry below and a matching fleet member
+# so ArgoCD gets a cluster secret, see fleet/members/_example/. Declare a cluster on
+# ONE path only: the platform's own spokes:enable-kro deletes the crossplane entry for
+# a cluster it moves to kro. region is intentionally omitted; the ApplicationSet
+# injects global.defaultRegion from the hub cluster secret's aws_region annotation.
+#
+#   clusters:
+#     example-dev:
+#       clusterName: example-dev
+#       vpcCidr: "10.1.0.0/16"
+#       kubernetesVersion: "1.35"
+#       autoMode: true
+#       resourcePrefix: <must match the hub's prefix>
+clusters: {}
