@@ -40,9 +40,20 @@ enabledAddons:
   cni_metrics_helper: false
   # Platform
   crossplane: true
-  kro: false
+  # KRO on the hub is required for KRO-based spoke provisioning. The hub itself was
+  # built by KRO running on the throwaway bootstrap cluster, but spokes are different:
+  # the clusters-kro ApplicationSet creates EksclusterWithVpc instances ON THE HUB, so
+  # the hub needs both the controller (kro) and the resource graph definitions
+  # (kro_manifests_hub) or those instances are accepted and then never reconciled,
+  # with empty STATE/READY and no events.
+  #
+  # Use kro_manifests_hub rather than kro_manifests: both point at the same manifests
+  # path, but kro_manifests excludes cicd-pipeline/huggingface/ray-service and is
+  # intended for spokes. The platform's addon registry documents the hub as the
+  # _hub-variant consumer.
+  kro: true
   kro_manifests: false
-  kro_manifests_hub: false
+  kro_manifests_hub: true
   multi_acct: false
   platform_manifests_bootstrap: true   # wave -1: creates the system-<prefix> Karpenter NodePool that system pods pin to
   platform_manifests: false            # wave 6: Ray-only IAMRoleSelector — inert here (Ray disabled)
