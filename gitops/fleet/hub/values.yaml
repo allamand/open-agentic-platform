@@ -30,13 +30,23 @@ externalSecret:
 # Safe to enable: $overlay becomes a REAL ArgoCD source, and this repo is public
 # and already read by ArgoCD (fleet-secret-hub and clusters-default already carry
 # a `ref: overlay` source pointing at this same URL).
+#
+# WARNING — this also drives SPOKE DISCOVERY. The clusters-kro ApplicationSet
+# resolves its git generator as
+#   repoURL:  or overlay_repo_url  fleetRepoURL
+#   revision: or overlay_repo_revision fleetRepoRevision
+#   basepath: or overlay_repo_basepath fleetRepoBasepath
+# so if these three point at a repo or revision that lacks
+# fleet/spoke-values/tenants/*/kro-clusters/clusters/*.json, the appset globs a
+# valid-but-wrong tree, finds no files, and generates ZERO spoke applications with
+# ErrorOccurred=False and no warning anywhere. Keep repoURL/revision in step with
+# fleetRepoURL/fleetRepoRevision. The crossplane clusters appset has no overlay
+# fallback, so it is unaffected and will disagree with clusters-kro if these drift.
 overlay:
-  repoURL: https://github.com/aws-samples/sample-open-agentic-platform.git
-  # MUST be a revision that actually CONTAINS the overlay files above. Kept in step
-  # with this cluster secret's fleetRepoRevision — update BOTH when this work
-  # merges (fix/parity-with-peeks -> main), otherwise $overlay resolves to a branch
-  # without overlays/clusters/hub/karpenter/values.yaml and manageAddons silently
-  # stays false.
-  revision: fix/parity-with-peeks
+  repoURL: https://github.com/awslabs/open-agentic-platform.git
+  # MUST be a revision of THIS repo that contains both the overlay files above and
+  # the spoke declarations under fleet/spoke-values/. Keep in step with the cluster
+  # secret's fleetRepoRevision; they are read together and drift is silent.
+  revision: feature/workshop-cloudfront-provisioning
   # Repo-relative root holding configs/ + overlays/. Matches addonsRepoBasepath.
   basepath: gitops/
