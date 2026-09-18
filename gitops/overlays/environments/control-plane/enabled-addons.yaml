@@ -40,19 +40,21 @@ enabledAddons:
   cni_metrics_helper: false
   # Platform
   crossplane: true
-  # KRO on the hub is required for KRO-based spoke provisioning. The hub itself was
-  # built by KRO running on the throwaway bootstrap cluster, but spokes are different:
-  # the clusters-kro ApplicationSet creates EksclusterWithVpc instances ON THE HUB, so
-  # the hub needs both the controller (kro) and the resource graph definitions
-  # (kro_manifests_hub) or those instances are accepted and then never reconciled,
-  # with empty STATE/READY and no events.
-  #
-  # Use kro_manifests_hub rather than kro_manifests: both point at the same manifests
-  # path, but kro_manifests excludes cicd-pipeline/huggingface/ray-service and is
-  # intended for spokes. The platform's addon registry documents the hub as the
-  # _hub-variant consumer.
-  kro: true
+  # KRO CONTROLLER: leave false. On this platform KRO is an EKS managed Capability
+  # (aws eks list-capabilities shows capabilityName kro, type KRO, ACTIVE), so its
+  # controller runs AWS-side and is deliberately NOT visible as pods in the cluster,
+  # exactly like the managed ArgoCD capability. Setting kro: true makes ArgoCD Helm
+  # install a SECOND controller from registry.k8s.io (registry defaultVersion 0.6.1)
+  # alongside the capability's newer build, and the two then fight over CRD ownership:
+  # RGDs go Inactive with "conflict detected: CRD <x>.kro.run has ownership by another
+  # ResourceGraphDefinition". Do not infer KRO is missing from an empty kro-system.
+  kro: false
   kro_manifests: false
+  # RGDs are NOT part of the capability and must still be applied. Without them the
+  # clusters-kro ApplicationSet creates an EksclusterWithVpc instance that is accepted
+  # and then never reconciled, with empty STATE/READY. Use the _hub variant: it applies
+  # the manifests tree recursively, whereas kro_manifests excludes cicd-pipeline,
+  # huggingface and ray-service and is the spoke variant per the platform's registry.
   kro_manifests_hub: true
   multi_acct: false
   platform_manifests_bootstrap: true   # wave -1: creates the system-<prefix> Karpenter NodePool that system pods pin to
