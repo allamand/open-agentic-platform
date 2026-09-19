@@ -100,9 +100,18 @@ tasks:
         if [ -d "{{.PLATFORM_DIR}}/.git" ]; then
           cd {{.PLATFORM_DIR}}
           git fetch --quiet origin "+refs/heads/{{.PLATFORM_REF}}:refs/remotes/origin/{{.PLATFORM_REF}}"
-          git checkout --quiet "{{.PLATFORM_REF}}" 2>/dev/null \
-            || git checkout --quiet -b "{{.PLATFORM_REF}}" "origin/{{.PLATFORM_REF}}"
-          git merge --ff-only --quiet "origin/{{.PLATFORM_REF}}" 2>/dev/null || true
+          # Check out the remote ref DETACHED and with --force, so the working tree is
+          # exactly that ref. This clone is a read-only materialized view of another repo,
+          # not a branch we develop on, and treating it as one has bitten twice:
+          #   - `git merge --ff-only ... || true` reported success while leaving the
+          #     checkout STALE, because the upstream ref had been force-pushed and a
+          #     diverged branch cannot fast-forward. The platform then runs old code while
+          #     the log claims it is current, which looks exactly like the fix not working.
+          #   - local debug edits to .platform survived and silently changed behaviour.
+          # --force discards local modifications, which is intended: anything that must
+          # persist belongs in this repo. Untracked files are left alone, because the
+          # platform writes generated kubeconfigs and credentials under .platform/private/.
+          git checkout --quiet --force --detach "origin/{{.PLATFORM_REF}}"
         else
           git clone --quiet --branch {{.PLATFORM_REF}} --single-branch {{.PLATFORM_REPO}} {{.PLATFORM_DIR}}
         fi
