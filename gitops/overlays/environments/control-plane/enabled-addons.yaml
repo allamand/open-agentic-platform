@@ -56,7 +56,20 @@ enabledAddons:
   # the manifests tree recursively, whereas kro_manifests excludes cicd-pipeline,
   # huggingface and ray-service and is the spoke variant per the platform's registry.
   kro_manifests_hub: true
-  multi_acct: false
+  # ACK role selection. Badly named: this addon owns IAMRoleSelector (ACK CARM), which
+  # maps a NAMESPACE to the IAM role ACK assumes for resources in it. It is required
+  # even in a single account, because ACK cannot reconcile resources in a namespace no
+  # selector covers.
+  #
+  # Needed once this hub provisions spokes. peeks-hub-ack-capability-role has no
+  # managed policies and cannot create EC2 resources; it only holds sts:AssumeRole on
+  # <resourcePrefix>-cluster-mgmt-*, and those roles carry the real permissions
+  # (AmazonEC2FullAccess / AmazonVPCFullAccess). With no selector for the spoke
+  # namespace ACK falls back to the capability role and the spoke VPC fails with
+  #   UnauthorizedOperation: ... not authorized to perform: ec2:CreateVpc
+  # The namespace-to-account map is gitops/configs/multi-acct/values.yaml. The chart
+  # self-covers the cluster it runs on, so the hub itself needs no entry.
+  multi_acct: true
   platform_manifests_bootstrap: true   # wave -1: creates the system-<prefix> Karpenter NodePool that system pods pin to
   platform_manifests: false            # wave 6: Ray-only IAMRoleSelector — inert here (Ray disabled)
   backstage: false
