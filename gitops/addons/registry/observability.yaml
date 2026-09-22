@@ -17,6 +17,7 @@ langfuse:
   valuesObject:
     global:
       awsRegion: '{{.metadata.annotations.aws_region}}'
+      insecure: '{{default "false" .metadata.annotations.insecure}}'
     clusterName: '{{.metadata.annotations.aws_cluster_name}}'
     ingress:
       enabled: true
