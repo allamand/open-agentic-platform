@@ -4,11 +4,14 @@
 # fleet/members/*/values.yaml and mints an ArgoCD cluster secret from this file;
 # every addon ApplicationSet then fans out across those secrets.
 #
-# Registration is separate from provisioning. This file only registers. The cluster
-# itself is declared in
-# fleet/spoke-values/tenants/default/crossplane-clusters/values.yaml, and the
-# Crossplane composition observes-and-updates the secret this creates to add
-# vpcId / subnet / security-group annotations once the VPC exists.
+# Registration is separate from provisioning. This file only registers; oap-dev is
+# provisioned via KRO (fleet/spoke-values/tenants/default/kro-clusters/values.yaml).
+#
+# mode: externalSecret is required for KRO spokes: it reads oap-dev/config from Secrets
+# Manager (written by the EksclusterWithVpc RGD) to populate aws_vpc_id / subnet / SG
+# annotations. Omitting it defaults to "direct" mode (Crossplane spokes) — the secret
+# never gets aws_vpc_id and the LBC crashloops on Auto Mode (can't reach IMDS).
+mode: externalSecret
 clusterName: oap-dev
 labels:
   # Selects the addon tier at overlays/environments/dev, where agent_platform is
