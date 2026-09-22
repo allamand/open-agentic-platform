@@ -57,6 +57,15 @@ spec:
                   number: 8080
 ---
 {{- $agentHost := .Values.ingress.agentHost | default (printf "agents.%s" .Values.ingress.host) }}
+{{- /*
+No-domain clusters (e.g. a KRO spoke with no CloudFront/Route53 hostname of its
+own) render .Values.ingress.host as "". "agents." is not a valid RFC 1123
+ingress host, unlike an empty host on the main ingress above (which Kubernetes
+accepts as a wildcard). There is no dedicated-subdomain equivalent without a
+parent domain, so skip this Ingress entirely rather than emit an invalid host;
+agent routes still reach agentgateway-proxy via its own NLB Service.
+*/}}
+{{- if .Values.ingress.host }}
 # Dedicated agent hostname: routes all paths to agentgateway-proxy.
 # Covered by the wildcard ACM cert. ExternalDNS creates the Route53 record.
 apiVersion: networking.k8s.io/v1
@@ -83,4 +92,5 @@ spec:
                 name: agentgateway-ingress
                 port:
                   number: 8080
+{{- end }}
 {{- end }}
