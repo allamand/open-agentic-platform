@@ -55,10 +55,23 @@ spec:
                 name: agentgateway-ingress
                 port:
                   number: 8080
+{{- /*
+  Dedicated agent hostname (agents.<host>): routes ALL paths to
+  agentgateway-proxy on a separate name covered by the wildcard ACM cert
+  (HTTPS:443; ExternalDNS creates the Route53 record).
+
+  Rendered ONLY in real-domain mode. In insecure/CloudFront mode the
+  ingress host annotation is empty (or a *.cloudfront.net domain), so
+  `printf "agents.%s" .Values.ingress.host` yields the invalid host
+  "agents." (RFC 1123 rejects it) and the whole app stays OutOfSync/Missing.
+  There is also no ACM cert / wildcard DNS for a cloudfront host. The primary
+  `agentgateway` ingress above already serves /sse and OAuth discovery on the
+  shared host (path-based, like backstage), so agents remain reachable without
+  this second host-based ingress.
+*/}}
+{{- if and .Values.ingress.host (not (contains "cloudfront.net" .Values.ingress.host)) }}
 ---
 {{- $agentHost := .Values.ingress.agentHost | default (printf "agents.%s" .Values.ingress.host) }}
-# Dedicated agent hostname: routes all paths to agentgateway-proxy.
-# Covered by the wildcard ACM cert. ExternalDNS creates the Route53 record.
 apiVersion: networking.k8s.io/v1
 kind: Ingress
 metadata:
@@ -83,4 +96,5 @@ spec:
                 name: agentgateway-ingress
                 port:
                   number: 8080
+{{- end }}
 {{- end }}
