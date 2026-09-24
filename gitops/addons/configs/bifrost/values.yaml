@@ -8,6 +8,15 @@ podIdentity:
   namespace: bifrost
   serviceAccountName: bifrost
 
+# ── Admin credentials (wrapper chart) ───────────────────────────────────────
+# Written into bifrost.bifrost.authConfig.existingSecret by templates/admin-secret.yaml.
+# Kept at TOP LEVEL (not under bifrost.authConfig) because the upstream subchart's
+# values schema rejects unknown keys there. Deterministic → no ArgoCD churn; override
+# the password per-env via the fleet-config overlay.
+adminAuth:
+  username: admin
+  password: "bifrost-admin"
+
 # ── Upstream maximhq/bifrost subchart ───────────────────────────────────────
 bifrost:
   image:
@@ -70,12 +79,6 @@ bifrost:
       existingSecret: bifrost-admin
       usernameKey: username
       passwordKey: password
-      # Credentials written into existingSecret by the wrapper chart
-      # (templates/admin-secret.yaml). Nothing else provisions bifrost-admin, so
-      # without these the governance pod fails CreateContainerConfigError. Deterministic
-      # (no ArgoCD churn); override the password per-env via the fleet-config overlay.
-      username: admin
-      password: "bifrost-admin"
       # Admin auth guards the API/dashboard; virtual-key enforcement on inference is
       # governed separately by client.enforceAuthOnInference below.
       disableAuthOnInference: false
