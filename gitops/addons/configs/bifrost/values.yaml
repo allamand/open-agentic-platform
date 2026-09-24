@@ -79,9 +79,14 @@ bifrost:
       existingSecret: bifrost-admin
       usernameKey: username
       passwordKey: password
-      # Admin auth guards the API/dashboard; virtual-key enforcement on inference is
-      # governed separately by client.enforceAuthOnInference below.
-      disableAuthOnInference: false
+      # Admin auth guards the API/dashboard. IMPORTANT: with authConfig.isEnabled=true,
+      # Bifrost gates ALL routes (inference included) unless inference is explicitly
+      # exempted here — client.enforceAuthOnInference=false is NOT sufficient (verified
+      # live: keyless inference returns 401 while this was false). Agents currently ship
+      # an EMPTY LLM_GATEWAY_API_KEY (no per-agent VK minting yet), so inference must be
+      # keyless. Keep true until per-workload VK minting is validated end-to-end, then
+      # flip to false in lockstep with client.enforceAuthOnInference + is_vk_mandatory.
+      disableAuthOnInference: true
 
     client:
       initialPoolSize: 100
