@@ -36,17 +36,18 @@ externalSecret:
 #   repoURL:  or overlay_repo_url  fleetRepoURL
 #   revision: or overlay_repo_revision fleetRepoRevision
 #   basepath: or overlay_repo_basepath fleetRepoBasepath
-# so if these three point at a repo or revision that lacks
+# so if these point at a repo or revision that lacks
 # fleet/spoke-values/tenants/*/kro-clusters/clusters/*.json, the appset globs a
 # valid-but-wrong tree, finds no files, and generates ZERO spoke applications with
-# ErrorOccurred=False and no warning anywhere. Keep repoURL/revision in step with
-# fleetRepoURL/fleetRepoRevision. The crossplane clusters appset has no overlay
-# fallback, so it is unaffected and will disagree with clusters-kro if these drift.
+# ErrorOccurred=False and no warning anywhere. useFleetRepo below makes that drift
+# impossible by construction: there is only one URL/revision to get wrong.
 overlay:
-  repoURL: https://github.com/awslabs/open-agentic-platform.git
-  # MUST be a revision of THIS repo that contains both the overlay files above and
-  # the spoke declarations under fleet/spoke-values/. Keep in step with the cluster
-  # secret's fleetRepoRevision; they are read together and drift is silent.
-  revision: feature/workshop-cloudfront-provisioning
+  # This repo IS the fleet repo, so inherit hub.fleetRepoURL / hub.fleetRepoRevision
+  # rather than restating them. Those trace back to a single source, config.local.yaml's
+  # agenticRepo.url / .revision, so the coordinates are declared exactly once and
+  # cannot drift out of step with the cluster secret's fleetRepo* annotations.
+  # Set repoURL/revision explicitly only for a genuinely separate overlay repo;
+  # an explicit value still wins over this flag.
+  useFleetRepo: true
   # Repo-relative root holding configs/ + overlays/. Matches addonsRepoBasepath.
   basepath: gitops/
