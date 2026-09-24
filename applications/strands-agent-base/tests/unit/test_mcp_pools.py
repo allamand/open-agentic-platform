@@ -40,7 +40,7 @@ def isolated_agent_state(monkeypatch, tmp_path):
             return [f"tool-{id(self)}"]
 
     FakeClient.instances = []
-    monkeypatch.setattr(agent_mod, "streamablehttp_client", fake_transport)
+    monkeypatch.setattr(agent_mod, "streamable_http_client", fake_transport)
     monkeypatch.setattr(agent_mod, "MCPClient", FakeClient)
     monkeypatch.setattr(config, "MCP_SERVER_NAMES_RAW", "mcp-time")
     monkeypatch.setattr(agent_mod, "_pools", {})
