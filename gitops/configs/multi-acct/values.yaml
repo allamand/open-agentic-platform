@@ -19,5 +19,8 @@
 # The key is the SPOKE NAMESPACE, which the clusters-kro ApplicationSet names after the
 # cluster. The chart self-covers the cluster it runs on, so the hub needs no entry.
 clusters:
-  # oap-dev spoke, same account as the hub.
-  oap-dev: "929819487611"
+  # oap-dev spoke, same account as the hub — no value means the multi-acct chart's
+  # per-entry fallback (`$value | default $.Values.global.accountId`) resolves it
+  # from the hub's own AWS identity at reconcile time, never a committed literal.
+  # Only give this an explicit value for a genuinely cross-account spoke.
+  oap-dev:

@@ -39,9 +39,13 @@ clusters:
     provider: "kro-ack"
     region: us-west-2
     k8sVersion: "1.35"
-    # Quoted deliberately: the RGD templates these as strings.
-    accountId: "929819487611"
-    managementAccountId: "929819487611"
+    # accountId/managementAccountId deliberately OMITTED. appmod-blueprints'
+    # kro-clusters chart resolves both via `default $.Values.global.accountId`
+    # (clusters.yaml), and clusters-kro.yaml's ApplicationSet template already
+    # populates global.accountId from the hub cluster secret's own
+    # aws_account_id annotation — the real AWS account, never committed to git.
+    # A real account ID belongs here only as a last resort if that fallback is
+    # ever unavailable; do not reintroduce it as a habit.
     # Must match the hub's prefix so the spoke can assume the hub's
     # <prefix>-cluster-mgmt-* roles via ACK CARM.
     resourcePrefix: peeks
