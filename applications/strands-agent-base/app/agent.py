@@ -12,7 +12,7 @@ logging.basicConfig(
 )
 
 from botocore.exceptions import ClientError
-from mcp.client.streamable_http import streamablehttp_client
+from mcp.client.streamable_http import streamable_http_client
 from strands import Agent
 from strands.models.openai import OpenAIModel
 from strands.tools.mcp.mcp_client import MCPClient
@@ -127,7 +127,7 @@ def _get_mcp_tools() -> list:
     for url in urls:
         logger.info(f"Connecting to MCP server: {url}")
         try:
-            client = MCPClient(lambda u=url: streamablehttp_client(u, headers=_gateway_headers()))
+            client = MCPClient(lambda u=url: streamable_http_client(u, headers=_gateway_headers()))
             client.start()
             server_tools = client.list_tools_sync()
             logger.info(f"  Loaded {len(server_tools)} tools from {url}")
