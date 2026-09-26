@@ -141,6 +141,19 @@ tasks:
     deps: [platform:clone]
     cmds:
       - |
+        # OAP-first + config unique: when the agentic config is ALREADY a full
+        # appmod-blueprints superset (it carries a top-level .repo.url, as produced
+        # by appmod's create-config.sh on the PEEKS IDE), use it VERBATIM as the
+        # platform config so a SINGLE config.local.yaml drives both layers. The thin
+        # template below would silently DROP PEEKS-critical fields that only the
+        # superset carries -- hub.network (reuse the IDE VPC, quota-safe), gitDomain,
+        # hub.autoMode, ingressName, adminRoleName -- yielding a divergent/broken
+        # platform install. When the config is NOT a superset (OAP-standalone use),
+        # derive the minimal config from the agentic vars as before.
+        if [ "$(yq -r '.repo.url // ""' {{.CONFIG_FILE}})" != "" ]; then
+          cp {{.CONFIG_FILE}} {{.PLATFORM_DIR}}/config.local.yaml
+          printf 'platform config: unified superset used verbatim (%s)\n' "{{.CONFIG_FILE}}"
+        else
         cat > {{.PLATFORM_DIR}}/config.local.yaml <<EOF
         clusterProvider: "{{.CLUSTER_PROVIDER}}"
         repo:
@@ -168,6 +181,7 @@ tasks:
           revision: "{{.AGENTIC_REPO_REVISION}}"
           basepath: "gitops/"
         EOF
+        fi
 
   platform:install:
     desc: Provision the base EKS platform
