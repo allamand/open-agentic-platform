@@ -4,13 +4,23 @@ vars:
   CONFIG_FILE: '{{.CONFIG_FILE | default "config.local.yaml"}}'
   PLATFORM_DIR: '.platform'
 
-  # Parsed from config
+  # Parsed from config.
+  # Repo-key alignment (OAP-first + config unique): OAP historically read the
+  # platform repo coordinates under `.platform.{repo,ref,clusterProvider}`, while
+  # the appmod-blueprints `create-config.sh` writes them as top-level `.repo.{url,
+  # revision}` + `.clusterProvider`. To let BOTH Taskfiles consume ONE superset
+  # config.local.yaml, fall back to the appmod schema when `.platform.*` is absent.
+  # Fully backward-compatible: a config that still carries `.platform.*` (e.g. the
+  # OAP-standalone `platform:configure` output) resolves exactly as before, so the
+  # `//` fallback is inert there. NOTE: the appmod key is `.repo` (NOT `.platform`)
+  # on purpose — setting `.platform.ref` would flip appmod's workshop Taskfile out
+  # of in-place mode into `.platform/` clone mode, which breaks the PEEKS install.
   PLATFORM_REPO:
-    sh: yq -r '.platform.repo' {{.CONFIG_FILE}}
+    sh: yq -r '.platform.repo // .repo.url' {{.CONFIG_FILE}}
   PLATFORM_REF:
-    sh: yq -r '.platform.ref' {{.CONFIG_FILE}}
+    sh: yq -r '.platform.ref // .repo.revision' {{.CONFIG_FILE}}
   CLUSTER_PROVIDER:
-    sh: yq -r '.platform.clusterProvider' {{.CONFIG_FILE}}
+    sh: yq -r '.platform.clusterProvider // .clusterProvider' {{.CONFIG_FILE}}
   AWS_REGION:
     sh: yq -r '.aws.region' {{.CONFIG_FILE}}
   AWS_ACCOUNT_ID:
