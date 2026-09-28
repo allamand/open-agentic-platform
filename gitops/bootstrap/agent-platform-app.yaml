@@ -40,8 +40,18 @@ spec:
           # from _defaults) gate placement within the bundle.
           globalSelectors:
             enable_agent_platform: "true"
-          repoURLGit: "${OAP_REPO_URL}"
-          repoURLGitRevision: "${OAP_REVISION}"
+          # NO HARDCODED REVISION HERE (annotation-driven, permanent).
+          # repoURLGit / repoURLGitRevision are deliberately NOT set in valuesObject.
+          # They fall through to registry/_defaults.yaml, which resolves them from the
+          # cluster-secret annotations at ApplicationSet generation time:
+          #   repoURLGit          <- {{default "<upstream>" .metadata.annotations.addons_repo_url}}
+          #   repoURLGitRevision  <- {{default "main"       .metadata.annotations.addons_repo_revision}}
+          # These OAP-scoped snake_case annotations are distinct from appmod's
+          # camelCase addonsRepoRevision, so the OAP revision is decoupled from the
+          # platform (appmod) revision. Overriding them here (baking ${OAP_REVISION})
+          # is what previously pinned every child appset to a fixed branch; removing
+          # the override makes the revision follow the cluster's SecretsManager config
+          # with no appset-level hardcode.
           # In-cluster overlay layer (Option A). The appset-chart already renders a
           # second `$overlay` source and appends its value files at highest precedence
           # (with ignoreMissingValueFiles: true, so absent overlay files are a no-op),
