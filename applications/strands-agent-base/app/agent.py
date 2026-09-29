@@ -43,11 +43,19 @@ _pools: dict = {}
 # The projected ServiceAccount token has a fixed TTL (expirationSeconds,
 # currently 1h). The kubelet rewrites the file before it expires, but an open
 # connection does not re-read it, so a long-lived workload pool would eventually
-# call tools with an expired credential. Recycle in place (stop() + start() on the
-# same MCPClient, which re-invokes the transport callable and therefore the
-# headers provider) well inside that lifetime; reusing the instances keeps
-# already-built Agents' tool objects valid, since those bind to MCPClient object
-# identity rather than a point-in-time session.
+# call tools with an expired credential. Recycle the pool well inside that
+# lifetime by rebuilding it: close the old MCPClients and open fresh ones, which
+# re-invokes the transport callable and therefore the headers provider so the new
+# connections carry the rotated token.
+#
+# We do NOT stop()+start() the same MCPClient in place: strands' MCPClient is not
+# restartable — stop() tears down its background event loop, so a subsequent
+# start() on the same instance fails with "Connection to the MCP server was
+# closed" (and orphans the close-event coroutine), leaving a dead connection that
+# every bound tool then calls into. Rebuilding sidesteps that entirely; cached
+# agents that bound to the old clients are invalidated on recycle (see
+# _invalidate_agents), and their conversation state is unaffected because it lives
+# in AgentCore Memory keyed by session id.
 #
 # Caller pools need no equivalent: their key is derived from the credential, so a
 # refreshed caller token yields a new pool instead of a stale one.
@@ -146,13 +154,16 @@ def _get_mcp_tools(key: str, headers: HeadersProvider) -> list:
             "Recycling %d workload MCP connection(s) to pick up the rotated token",
             len(pool.clients),
         )
-        for client in pool.clients:
-            try:
-                client.stop(None, None, None)
-                client.start()
-            except Exception as exc:
-                logger.warning(f"  Failed to recycle MCP connection: {exc}")
-        pool.connected_at = time.monotonic()
+        # Rebuild rather than restart in place: MCPClient is not restartable
+        # (stop() kills its event loop; a same-instance start() then fails and
+        # leaves a dead connection). _close + _open yields fresh clients whose
+        # headers provider re-reads the rotated token.
+        _close(pool)
+        pool.tools = []
+        _open(pool, urls)
+        # Cached agents hold tool objects bound to the just-closed clients, so
+        # drop them: get_or_create_agent will rebuild against the fresh pool.
+        _invalidate_agents()
 
     # Re-insert last so dict insertion order doubles as the LRU order.
     _pools[key] = pool
@@ -246,6 +257,20 @@ def create_agent(session_id: Optional[str] = None, actor_id: str = "user") -> Ag
 # ── session cache ────────────────────────────────────────────────────────
 
 _agents: dict[tuple, Agent] = {}
+
+
+def _invalidate_agents() -> None:
+    """Drop all cached agents after a workload MCP pool rebuild.
+
+    Cached agents bind to the tool objects of MCPClient instances that a recycle
+    has just closed, so calling them would hit dead connections. Clearing the
+    cache makes get_or_create_agent reconstruct them against the fresh pool on
+    next use. Conversation state is preserved: it lives in AgentCore Memory keyed
+    by session id, which the rebuilt agent's session manager reloads.
+    """
+    if _agents:
+        logger.info("Invalidating %d cached agent(s) after workload MCP recycle", len(_agents))
+        _agents.clear()
 
 
 def get_or_create_agent(session_id: Optional[str] = None, actor_id: str = "user") -> tuple[Agent, str]:
