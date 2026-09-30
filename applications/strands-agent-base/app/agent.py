@@ -6,7 +6,13 @@ import os
 import re
 import time
 import uuid
+from contextlib import contextmanager
 from typing import Optional
+
+try:
+    from opentelemetry import context as _otel_context
+except Exception:  # opentelemetry not installed → context isolation is a no-op
+    _otel_context = None
 
 logging.basicConfig(
     level=getattr(logging, os.getenv("LOG_LEVEL", "INFO").upper()),
@@ -107,6 +113,30 @@ def _get_model() -> OpenAIModel:
     return _model
 
 
+# ── OTEL context isolation for pooled MCP connections ─────────────────────
+# MCPClient.start() spawns a background event loop; anyio copies the *current*
+# OTEL context (a ContextVar) into that task and it persists for the whole
+# lifetime of the (pooled, cross-request) connection. Every HTTP op the
+# background loop later makes — notably the session-teardown DELETE at
+# recycle/LRU-close, potentially hours later — is then parented to whatever
+# request span happened to be active at start(). Langfuse derives trace
+# duration as max(end)-min(start) across observations, so a single stray late
+# DELETE glued to the original trace inflates that request's trace to hours.
+# Opening and closing the connection under a detached (empty root) context
+# keeps those transport spans off the request trace (they become their own
+# short root traces), so per-request traces reflect real agent latency.
+@contextmanager
+def _detached_otel_context():
+    if _otel_context is None:  # opentelemetry unavailable → no-op
+        yield
+        return
+    token = _otel_context.attach(_otel_context.Context())
+    try:
+        yield
+    finally:
+        _otel_context.detach(token)
+
+
 def _open(pool: _McpPool, urls: list) -> None:
     for url in urls:
         logger.info(f"Connecting to MCP server: {url}")
@@ -114,8 +144,11 @@ def _open(pool: _McpPool, urls: list) -> None:
             client = MCPClient(
                 lambda u=url, p=pool: streamablehttp_client(u, headers=p.headers())
             )
-            client.start()
-            server_tools = client.list_tools_sync()
+            # Detach so the transport's background loop does not capture the
+            # active request span for the connection's lifetime (see above).
+            with _detached_otel_context():
+                client.start()
+                server_tools = client.list_tools_sync()
             logger.info(f"  Loaded {len(server_tools)} tools from {url}")
             pool.clients.append(client)
             pool.tools.extend(server_tools)
@@ -127,7 +160,10 @@ def _open(pool: _McpPool, urls: list) -> None:
 def _close(pool: _McpPool) -> None:
     for client in pool.clients:
         try:
-            client.stop(None, None, None)
+            # Detach so the session-teardown DELETE is not parented to the
+            # caller's request trace (covers transports that issue it inline).
+            with _detached_otel_context():
+                client.stop(None, None, None)
         except Exception as exc:
             logger.warning(f"  Failed to close MCP connection: {exc}")
     pool.clients = []
