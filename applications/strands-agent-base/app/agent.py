@@ -297,13 +297,19 @@ def _build_session_manager(session_id: str, actor_id: str):
 # name filtering could do before (session_id was empty and untagged).
 def _trace_attributes(session_id: str, actor_id: str) -> dict:
     source = "rca" if (session_id or "").startswith("incident-") else "chat"
+    tags = [f"source:{source}", config.AGENT_NAME]
     return {
         # Raw session id (what we echo back as contextId) so the Langfuse
         # Session groups by conversation/incident. Langfuse has no AgentCore
         # charset constraint, so the raw value is fine here.
         "session.id": session_id or "",
         "user.id": actor_id or "user",
-        "tags": [f"source:{source}", config.AGENT_NAME],
+        # Langfuse lifts trace tags ONLY from "langfuse.trace.tags" (verified
+        # empirically: a bare "tags" attribute is ignored, while session.id /
+        # user.id ARE accepted as fallbacks). Keep "tags" too — inert on this
+        # Langfuse version but forward-compatible and harmless.
+        "langfuse.trace.tags": tags,
+        "tags": tags,
     }
 
 
