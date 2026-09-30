@@ -108,7 +108,7 @@ def _get_model() -> OpenAIModel:
                 "default_headers": {"x-bf-vk": vk},
             },
             model_id=config.MODEL_ID,
-            params={"max_tokens": config.MODEL_MAX_TOKENS, "temperature": 0.7, "stream": True},
+            params={"max_tokens": 1000, "temperature": 0.7, "stream": True},
         )
     return _model
 
