@@ -284,6 +284,29 @@ def _build_session_manager(session_id: str, actor_id: str):
     return sm
 
 
+# ── Langfuse/OTEL trace attributes ───────────────────────────────────────
+# Strands applies these to the agent's trace span; Langfuse lifts the
+# well-known keys to trace level: ``session.id`` -> Session view (groups every
+# turn of one conversation / one incident), ``user.id`` -> User, ``tags`` ->
+# filterable tags. We derive the source from the session id rather than a
+# separate flag: the incident-bridge sets the A2A contextId to
+# "incident-<fingerprint>" for autonomous RCA and leaves it caller-supplied
+# (or a fresh UUID) for interactive chat — so a "incident-" prefix is a
+# reliable, transport-agnostic discriminator. This lets Langfuse filter
+# tags=source:rca vs source:chat in one click, which neither session_id nor
+# name filtering could do before (session_id was empty and untagged).
+def _trace_attributes(session_id: str, actor_id: str) -> dict:
+    source = "rca" if (session_id or "").startswith("incident-") else "chat"
+    return {
+        # Raw session id (what we echo back as contextId) so the Langfuse
+        # Session groups by conversation/incident. Langfuse has no AgentCore
+        # charset constraint, so the raw value is fine here.
+        "session.id": session_id or "",
+        "user.id": actor_id or "user",
+        "tags": [f"source:{source}", config.AGENT_NAME],
+    }
+
+
 @retry(
     retry=retry_if_exception(_is_access_denied),
     wait=wait_exponential(multiplier=1, max=16),
@@ -309,6 +332,7 @@ def _construct_agent(session_id: str, actor_id: str) -> Agent:
         name=config.AGENT_NAME,
         description=config.AGENT_DESCRIPTION,
         session_manager=session_manager,
+        trace_attributes=_trace_attributes(session_id, actor_id),
     )
 
 
