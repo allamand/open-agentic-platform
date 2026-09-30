@@ -23,8 +23,12 @@ from .identity import capture_caller_auth
 # real tree in Langfuse. Their span names all share the module prefix
 # "a2a.server.events." (span name = "<module>.<Class>.<method>"), whereas the
 # useful root span lives under "a2a.server.request_handlers.", so a name-prefix
-# drop is surgical and version-robust. Overridable via
-# OTEL_DROP_SPAN_NAME_PREFIXES (comma-separated); empty disables filtering.
+# drop is surgical and version-robust. The a2a-sdk also @trace-decorates its
+# module-level helpers under "a2a.utils." (e.g.
+# "a2a.utils.helpers.append_artifact_to_task"), emitted once per artifact/event
+# — pure plumbing that likewise buries the tree — so that prefix is dropped too.
+# Overridable via OTEL_DROP_SPAN_NAME_PREFIXES (comma-separated); empty disables
+# filtering.
 #
 # We can't set this via OTEL_TRACES_SAMPLER (no built-in name filter) so we
 # build the provider and hand it to StrandsTelemetry(tracer_provider=...).
@@ -59,7 +63,9 @@ def _build_filtered_tracer_provider():
 
     prefixes = tuple(
         p.strip()
-        for p in os.getenv("OTEL_DROP_SPAN_NAME_PREFIXES", "a2a.server.events.").split(",")
+        for p in os.getenv(
+            "OTEL_DROP_SPAN_NAME_PREFIXES", "a2a.server.events.,a2a.utils."
+        ).split(",")
         if p.strip()
     )
     if not prefixes:
