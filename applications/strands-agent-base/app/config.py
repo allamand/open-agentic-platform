@@ -27,6 +27,10 @@ For example, always use the time tool when asked about the current time or date.
     
     # Model configuration
     MODEL_ID: str = os.getenv("MODEL_ID", "claude-sonnet")
+    # Max output tokens per LLM turn. Default 4096 (was hard-coded 1000, which
+    # truncated long answers — YAML/config responses — mid-generation, surfacing
+    # as a MaxTokensReachedException / ERROR span). Override via MODEL_MAX_TOKENS.
+    MODEL_MAX_TOKENS: int = int(os.getenv("MODEL_MAX_TOKENS", "4096"))
     AWS_REGION: str = os.getenv("AWS_REGION", "us-west-2")
     
     # LLM Gateway configuration (Bifrost, OpenAI-compatible endpoint at /v1)
