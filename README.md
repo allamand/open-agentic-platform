@@ -280,7 +280,7 @@ plane. See [`docs/dark-factory/`](docs/dark-factory/) and [`examples/dark-factor
 The same Kata isolation substrate is available to **any** agent, not only the Dark Factory coder, via
 a single opt-in on the OAM `agent` component: `sandbox: true` runs the agent inside a Kata microVM
 with a hardened `securityContext`, while keeping blue-green delivery, `replicas`, Services and gateway
-routing unchanged. See [`docs/sandbox-agents/`](docs/sandbox-agents/).
+routing unchanged. See [`docs/sandbox-agents/DESIGN.md`](docs/sandbox-agents/DESIGN.md).
 
 ---
 
