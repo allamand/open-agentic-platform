@@ -4,7 +4,13 @@ import logging
 import os
 import time
 import uuid
+from contextlib import contextmanager
 from typing import Optional
+
+try:
+    from opentelemetry import context as _otel_context
+except Exception:  # opentelemetry not installed → context isolation is a no-op
+    _otel_context = None
 
 logging.basicConfig(
     level=getattr(logging, os.getenv("LOG_LEVEL", "INFO").upper()),
@@ -43,11 +49,19 @@ _pools: dict = {}
 # The projected ServiceAccount token has a fixed TTL (expirationSeconds,
 # currently 1h). The kubelet rewrites the file before it expires, but an open
 # connection does not re-read it, so a long-lived workload pool would eventually
-# call tools with an expired credential. Recycle in place (stop() + start() on the
-# same MCPClient, which re-invokes the transport callable and therefore the
-# headers provider) well inside that lifetime; reusing the instances keeps
-# already-built Agents' tool objects valid, since those bind to MCPClient object
-# identity rather than a point-in-time session.
+# call tools with an expired credential. Recycle the pool well inside that
+# lifetime by rebuilding it: close the old MCPClients and open fresh ones, which
+# re-invokes the transport callable and therefore the headers provider so the new
+# connections carry the rotated token.
+#
+# We do NOT stop()+start() the same MCPClient in place: strands' MCPClient is not
+# restartable — stop() tears down its background event loop, so a subsequent
+# start() on the same instance fails with "Connection to the MCP server was
+# closed" (and orphans the close-event coroutine), leaving a dead connection that
+# every bound tool then calls into. Rebuilding sidesteps that entirely; cached
+# agents that bound to the old clients are invalidated on recycle (see
+# _invalidate_agents), and their conversation state is unaffected because it lives
+# in AgentCore Memory keyed by session id.
 #
 # Caller pools need no equivalent: their key is derived from the credential, so a
 # refreshed caller token yields a new pool instead of a stale one.
@@ -97,6 +111,30 @@ def _get_model() -> OpenAIModel:
     return _model
 
 
+# ── OTEL context isolation for pooled MCP connections ─────────────────────
+# MCPClient.start() spawns a background event loop; anyio copies the *current*
+# OTEL context (a ContextVar) into that task and it persists for the whole
+# lifetime of the (pooled, cross-request) connection. Every HTTP op the
+# background loop later makes — notably the session-teardown DELETE at
+# recycle/LRU-close, potentially hours later — is then parented to whatever
+# request span happened to be active at start(). Langfuse derives trace
+# duration as max(end)-min(start) across observations, so a single stray late
+# DELETE glued to the original trace inflates that request's trace to hours.
+# Opening and closing the connection under a detached (empty root) context
+# keeps those transport spans off the request trace (they become their own
+# short root traces), so per-request traces reflect real agent latency.
+@contextmanager
+def _detached_otel_context():
+    if _otel_context is None:  # opentelemetry unavailable → no-op
+        yield
+        return
+    token = _otel_context.attach(_otel_context.Context())
+    try:
+        yield
+    finally:
+        _otel_context.detach(token)
+
+
 def _open(pool: _McpPool, urls: list) -> None:
     for url in urls:
         logger.info(f"Connecting to MCP server: {url}")
@@ -109,8 +147,11 @@ def _open(pool: _McpPool, urls: list) -> None:
                     u, http_client=create_mcp_http_client(headers=p.headers())
                 )
             )
-            client.start()
-            server_tools = client.list_tools_sync()
+            # Detach so the transport's background loop does not capture the
+            # active request span for the connection's lifetime (see above).
+            with _detached_otel_context():
+                client.start()
+                server_tools = client.list_tools_sync()
             logger.info(f"  Loaded {len(server_tools)} tools from {url}")
             pool.clients.append(client)
             pool.tools.extend(server_tools)
@@ -122,7 +163,10 @@ def _open(pool: _McpPool, urls: list) -> None:
 def _close(pool: _McpPool) -> None:
     for client in pool.clients:
         try:
-            client.stop(None, None, None)
+            # Detach so the session-teardown DELETE is not parented to the
+            # caller's request trace (covers transports that issue it inline).
+            with _detached_otel_context():
+                client.stop(None, None, None)
         except Exception as exc:
             logger.warning(f"  Failed to close MCP connection: {exc}")
     pool.clients = []
@@ -146,13 +190,16 @@ def _get_mcp_tools(key: str, headers: HeadersProvider) -> list:
             "Recycling %d workload MCP connection(s) to pick up the rotated token",
             len(pool.clients),
         )
-        for client in pool.clients:
-            try:
-                client.stop(None, None, None)
-                client.start()
-            except Exception as exc:
-                logger.warning(f"  Failed to recycle MCP connection: {exc}")
-        pool.connected_at = time.monotonic()
+        # Rebuild rather than restart in place: MCPClient is not restartable
+        # (stop() kills its event loop; a same-instance start() then fails and
+        # leaves a dead connection). _close + _open yields fresh clients whose
+        # headers provider re-reads the rotated token.
+        _close(pool)
+        pool.tools = []
+        _open(pool, urls)
+        # Cached agents hold tool objects bound to the just-closed clients, so
+        # drop them: get_or_create_agent will rebuild against the fresh pool.
+        _invalidate_agents()
 
     # Re-insert last so dict insertion order doubles as the LRU order.
     _pools[key] = pool
@@ -202,6 +249,35 @@ def _build_session_manager(session_id: str, actor_id: str):
     return sm
 
 
+# ── Langfuse/OTEL trace attributes ───────────────────────────────────────
+# Strands applies these to the agent's trace span; Langfuse lifts the
+# well-known keys to trace level: ``session.id`` -> Session view (groups every
+# turn of one conversation / one incident), ``user.id`` -> User, ``tags`` ->
+# filterable tags. We derive the source from the session id rather than a
+# separate flag: the incident-bridge sets the A2A contextId to
+# "incident-<fingerprint>" for autonomous RCA and leaves it caller-supplied
+# (or a fresh UUID) for interactive chat — so a "incident-" prefix is a
+# reliable, transport-agnostic discriminator. This lets Langfuse filter
+# tags=source:rca vs source:chat in one click, which neither session_id nor
+# name filtering could do before (session_id was empty and untagged).
+def _trace_attributes(session_id: str, actor_id: str) -> dict:
+    source = "rca" if (session_id or "").startswith("incident-") else "chat"
+    tags = [f"source:{source}", config.AGENT_NAME]
+    return {
+        # Raw session id (what we echo back as contextId) so the Langfuse
+        # Session groups by conversation/incident. Langfuse has no AgentCore
+        # charset constraint, so the raw value is fine here.
+        "session.id": session_id or "",
+        "user.id": actor_id or "user",
+        # Langfuse lifts trace tags ONLY from "langfuse.trace.tags" (verified
+        # empirically: a bare "tags" attribute is ignored, while session.id /
+        # user.id ARE accepted as fallbacks). Keep "tags" too — inert on this
+        # Langfuse version but forward-compatible and harmless.
+        "langfuse.trace.tags": tags,
+        "tags": tags,
+    }
+
+
 @retry(
     retry=retry_if_exception(_is_access_denied),
     wait=wait_exponential(multiplier=1, max=16),
@@ -227,6 +303,7 @@ def _construct_agent(session_id: str, actor_id: str) -> Agent:
         name=config.AGENT_NAME,
         description=config.AGENT_DESCRIPTION,
         session_manager=session_manager,
+        trace_attributes=_trace_attributes(session_id, actor_id),
     )
 
 
@@ -246,6 +323,20 @@ def create_agent(session_id: Optional[str] = None, actor_id: str = "user") -> Ag
 # ── session cache ────────────────────────────────────────────────────────
 
 _agents: dict[tuple, Agent] = {}
+
+
+def _invalidate_agents() -> None:
+    """Drop all cached agents after a workload MCP pool rebuild.
+
+    Cached agents bind to the tool objects of MCPClient instances that a recycle
+    has just closed, so calling them would hit dead connections. Clearing the
+    cache makes get_or_create_agent reconstruct them against the fresh pool on
+    next use. Conversation state is preserved: it lives in AgentCore Memory keyed
+    by session id, which the rebuilt agent's session manager reloads.
+    """
+    if _agents:
+        logger.info("Invalidating %d cached agent(s) after workload MCP recycle", len(_agents))
+        _agents.clear()
 
 
 def get_or_create_agent(session_id: Optional[str] = None, actor_id: str = "user") -> tuple[Agent, str]:
