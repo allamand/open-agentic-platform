@@ -48,6 +48,8 @@ def isolated_agent_state(monkeypatch, tmp_path):
     monkeypatch.setattr(agent_mod, "MCPClient", FakeClient)
     monkeypatch.setattr(config, "MCP_SERVER_NAMES_RAW", "mcp-time")
     monkeypatch.setattr(agent_mod, "_pools", {})
+    # Keep the connect-retry budget exercised but instant (no real backoff).
+    monkeypatch.setattr(agent_mod, "_MCP_CONNECT_MAX_WAIT", 0)
 
     sa = tmp_path / "token"
     sa.write_text("sa-token-v1")
@@ -168,10 +170,43 @@ def test_shutdown_closes_every_pool(isolated_agent_state):
 
 
 def test_connect_failure_is_contained(monkeypatch, isolated_agent_state):
+    monkeypatch.setattr(agent_mod, "_MCP_CONNECT_MAX_ATTEMPTS", 3)
+
     class Failing(isolated_agent_state["clients"]):
         def start(self):
+            super().start()
             raise RuntimeError("connect refused")
 
     monkeypatch.setattr(agent_mod, "MCPClient", Failing)
     _, tools = _tools_for("Bearer alice.jwt")
+
+    # A persistently-failing server exhausts its bounded retry budget, is
+    # logged, and leaves the agent with no tools from it — without raising.
     assert tools == []
+    assert len(isolated_agent_state["clients"].instances) == 3, "retried to budget"
+    assert all(c.stops == 1 for c in isolated_agent_state["clients"].instances), (
+        "each failed attempt closes its half-started client"
+    )
+
+
+def test_connect_retries_through_transient_failure(monkeypatch, isolated_agent_state):
+    """A first-boot warm-up race (gateway 500 before the backend is Ready)
+    must self-resolve: the connect retries and the agent ends up with tools,
+    never a cached half-blind pool that needs a manual restart."""
+    monkeypatch.setattr(agent_mod, "_MCP_CONNECT_MAX_ATTEMPTS", 5)
+
+    class FlakyThenOk(isolated_agent_state["clients"]):
+        attempts = 0
+
+        def start(self):
+            super().start()
+            FlakyThenOk.attempts += 1
+            if FlakyThenOk.attempts < 3:  # fail twice, succeed on the 3rd
+                raise RuntimeError("gateway 500: backend warming up")
+
+    monkeypatch.setattr(agent_mod, "MCPClient", FlakyThenOk)
+    key, tools = _tools_for("Bearer alice.jwt")
+
+    assert tools, "tools loaded after transient failures"
+    assert FlakyThenOk.attempts == 3, "retried until the backend was Ready"
+    assert len(agent_mod._pools[key].clients) == 1, "exactly one live client pooled"
