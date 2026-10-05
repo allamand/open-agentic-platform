@@ -24,7 +24,7 @@ from mcp.client.streamable_http import create_mcp_http_client, streamable_http_c
 from strands import Agent
 from strands.models.openai import OpenAIModel
 from strands.tools.mcp.mcp_client import MCPClient
-from tenacity import retry, retry_if_exception, stop_after_attempt, wait_exponential, before_sleep_log
+from tenacity import retry, retry_if_exception, stop_after_attempt, wait_exponential, before_sleep_log, Retrying
 
 try:
     from strands.multiagent.a2a.server import _AGENT_CARD_CONTEXT_ID
@@ -141,28 +141,77 @@ def _detached_otel_context():
         _otel_context.detach(token)
 
 
+# On a fresh cluster the agent pod can become Ready before an MCP backend (or
+# its agentgateway route) is — the connect then fails one-shot (typically a
+# transient HTTP 500 from the gateway before the backend Deployment is Ready).
+# The original single-attempt connect dropped that server's tools *permanently*
+# and the partial pool was cached, so the agent stayed half-blind (e.g. only
+# skills-mcp, missing eks-read-mcp/gitlab-mcp) until a manual pod restart.
+# Retry each server with bounded exponential backoff so a first-boot ordering
+# race self-resolves without any manual intervention. Defaults (~12 attempts,
+# 30s cap ≈ 3.5 min total) comfortably exceed the observed warm-up gap; both are
+# env-tunable. A genuinely-down server still fails after the budget and is
+# logged, without blocking the other servers.
+_MCP_CONNECT_MAX_ATTEMPTS = int(os.getenv("MCP_CONNECT_MAX_ATTEMPTS", "12"))
+_MCP_CONNECT_MAX_WAIT = int(os.getenv("MCP_CONNECT_MAX_WAIT", "30"))
+
+
+def _connect_one(pool: _McpPool, url: str) -> MCPClient:
+    """Open one MCP connection and load its tools, retrying through warm-up.
+
+    Retries any failure (gateway 500, connection refused, list_tools error)
+    with bounded exponential backoff. On a failed attempt the half-started
+    client is closed before the next try so retries do not leak connections.
+    Tools are appended to the pool only once, on the successful attempt. The
+    connect runs under a detached OTEL context so the transport's background
+    loop does not capture the active request span (see _detached_otel_context).
+
+    The retry controller is built per call so the ``_MCP_CONNECT_*`` budget
+    stays monkeypatchable (tests set wait=0 / attempts=1).
+    """
+
+    def _attempt() -> MCPClient:
+        # headers travel on a pre-built httpx client (mcp SDK via strands 1.57.0)
+        client = MCPClient(
+            lambda u=url, p=pool: streamable_http_client(
+                u, http_client=create_mcp_http_client(headers=p.headers())
+            )
+        )
+        try:
+            with _detached_otel_context():
+                client.start()
+                server_tools = client.list_tools_sync()
+        except Exception:
+            try:
+                with _detached_otel_context():
+                    client.stop(None, None, None)
+            except Exception:
+                pass
+            raise
+        logger.info(f"  Loaded {len(server_tools)} tools from {url}")
+        pool.tools.extend(server_tools)
+        return client
+
+    retryer = Retrying(
+        wait=wait_exponential(multiplier=1, max=_MCP_CONNECT_MAX_WAIT),
+        stop=stop_after_attempt(_MCP_CONNECT_MAX_ATTEMPTS),
+        before_sleep=before_sleep_log(logger, logging.WARNING),
+        reraise=True,
+    )
+    return retryer(_attempt)
+
+
 def _open(pool: _McpPool, urls: list) -> None:
     for url in urls:
         logger.info(f"Connecting to MCP server: {url}")
         try:
-            # streamable_http_client no longer takes a `headers` kwarg directly
-            # (mcp SDK, pulled in via strands-agents 1.57.0's bump): headers now
-            # travel on a pre-built httpx client passed as `http_client`.
-            client = MCPClient(
-                lambda u=url, p=pool: streamable_http_client(
-                    u, http_client=create_mcp_http_client(headers=p.headers())
-                )
-            )
-            # Detach so the transport's background loop does not capture the
-            # active request span for the connection's lifetime (see above).
-            with _detached_otel_context():
-                client.start()
-                server_tools = client.list_tools_sync()
-            logger.info(f"  Loaded {len(server_tools)} tools from {url}")
+            client = _connect_one(pool, url)
             pool.clients.append(client)
-            pool.tools.extend(server_tools)
         except Exception as exc:
-            logger.warning(f"  Failed to connect to MCP server {url}: {exc}")
+            logger.warning(
+                f"  Failed to connect to MCP server {url} after "
+                f"{_MCP_CONNECT_MAX_ATTEMPTS} attempts: {exc}"
+            )
     pool.connected_at = time.monotonic()
 
 
