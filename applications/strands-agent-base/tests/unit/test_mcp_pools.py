@@ -111,8 +111,13 @@ def test_workload_pool_recycles_and_rereads_the_rotated_token(isolated_agent_sta
 
     _tools_for(None)
 
-    assert client.stops == 1 and client.starts == 2, "recycled in place"
-    assert isolated_agent_state["clients"].instances == [client], "same instance reused"
+    instances = isolated_agent_state["clients"].instances
+    # Recycle REBUILDS the pool (MCPClient is not restartable): the old client
+    # is closed, not restarted in place, and a fresh client is opened whose
+    # headers provider re-reads the rotated token.
+    assert client.stops == 1 and client.starts == 1, "old client closed, not restarted in place"
+    assert len(instances) == 2 and instances[0] is client, "pool rebuilt with a fresh client"
+    assert instances[1].starts == 1, "fresh client started once"
     _, headers = isolated_agent_state["calls"][-1]
     assert headers["Authorization"] == "Bearer sa-token-v2"
 
