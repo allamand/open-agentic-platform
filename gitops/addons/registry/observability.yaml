@@ -79,7 +79,13 @@ otel-collector:
       awsRegion: '{{.metadata.annotations.aws_region}}'
     langfuse:
       enabled: true
-      endpoint: 'https://{{.metadata.annotations.ingress_domain_name}}/api/public/otel'
+      # Single hub Langfuse for the whole fleet. The hub sets ingress_domain_name
+      # (its CloudFront host) and uses it directly. A spoke has an EMPTY
+      # ingress_domain_name and no public domain of its own, so it falls back to
+      # the host of oidc_issuer_url (every spoke carries it, pointing at the hub
+      # domain) -> spoke ADOT collectors export traces to the hub Langfuse.
+      # No-op on the hub (ingress_domain_name non-empty takes the first branch).
+      endpoint: 'https://{{ $d := index .metadata.annotations "ingress_domain_name" }}{{ if $d }}{{ $d }}{{ else }}{{ (splitList "/" (trimPrefix "https://" (index .metadata.annotations "oidc_issuer_url"))) | first }}{{ end }}/api/public/otel'
       secretManagerKey: 'hub/langfuse-otel'
     bifrost:
       enabled: true
