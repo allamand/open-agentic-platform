@@ -22,8 +22,10 @@ logging.basicConfig(
 from botocore.exceptions import ClientError
 from mcp.client.streamable_http import create_mcp_http_client, streamable_http_client
 from strands import Agent
+from strands.agent.agent_result import AgentResult
 from strands.models.openai import OpenAIModel
 from strands.tools.mcp.mcp_client import MCPClient
+from strands.types.exceptions import MaxTokensReachedException
 from tenacity import retry, retry_if_exception, stop_after_attempt, wait_exponential, before_sleep_log, Retrying
 
 try:
@@ -371,6 +373,65 @@ def _trace_attributes(session_id: str, actor_id: str) -> dict:
     }
 
 
+# ── graceful max_tokens handling ──────────────────────────────────────────
+# When a generation hits the per-request output cap, Strands' event loop raises
+# MaxTokensReachedException *after* it has already streamed the partial answer.
+# Both consumers of the agent — the A2A executor (the chat UI / incident-bridge
+# path) and invoke_async (the /chat endpoint) — let that exception propagate:
+# the A2A task then transitions to `failed` with the opaque text "Agent
+# execution failed" and the chat shows the answer cut off mid-sentence with no
+# reason; /chat returns {"error": ...}. The user cannot tell truncation from a
+# real crash.
+#
+# This guard wraps the agent's own stream_async (which invoke_async also drives,
+# so one wrap covers both paths). On MaxTokensReachedException it does NOT
+# re-raise: it emits one more text chunk (config.MAX_TOKENS_NOTICE) so the chat
+# shows *why* the answer stopped, then yields a terminal AgentResult
+# (stop_reason="max_tokens") built from the text already streamed this turn.
+# The A2A executor sees a normal result and marks the task `completed`;
+# invoke_async returns an AgentResult whose __str__ is the partial answer plus
+# the notice. Any *other* exception still propagates and still fails the task.
+def _install_truncation_guard(agent: Agent) -> None:
+    """Turn an unhandled max_tokens truncation into a graceful, visible notice."""
+    if not config.MAX_TOKENS_NOTICE_ENABLED:
+        return
+
+    original_stream = agent.stream_async
+    notice = config.MAX_TOKENS_NOTICE
+
+    async def _guarded(*args, **kwargs):
+        buffered: list[str] = []
+        try:
+            async for event in original_stream(*args, **kwargs):
+                if isinstance(event, dict) and isinstance(event.get("data"), str):
+                    buffered.append(event["data"])
+                yield event
+        except MaxTokensReachedException:
+            logger.warning(
+                "Response truncated: max_tokens=%s reached mid-generation; "
+                "finishing turn with a visible notice instead of failing the task.",
+                config.MAX_TOKENS,
+            )
+            # 1) stream the notice so the UI renders it as the tail of the answer
+            yield {"data": "\n\n" + notice}
+            # 2) emit a terminal result so invoke_async returns and the A2A
+            #    executor completes (not fails) the task. message carries the
+            #    partial text already streamed this turn + the notice, so
+            #    str(result) (used by /chat) renders the full partial answer.
+            partial_text = ("".join(buffered) + "\n\n" + notice).strip()
+            message = {"role": "assistant", "content": [{"text": partial_text}]}
+            yield {
+                "result": AgentResult(
+                    stop_reason="max_tokens",
+                    message=message,
+                    metrics=agent.event_loop_metrics,
+                    state={},
+                )
+            }
+
+    agent.stream_async = _guarded
+
+
 @retry(
     retry=retry_if_exception(_is_access_denied),
     wait=wait_exponential(multiplier=1, max=16),
@@ -388,7 +449,7 @@ def _construct_agent(session_id: str, actor_id: str) -> Agent:
     session_manager = _build_session_manager(session_id, actor_id)
     headers, key = outbound(config.PROPAGATE_CALLER_TOKEN)
     tools = _get_mcp_tools(key, headers) or None
-    return Agent(
+    agent = Agent(
         model=_get_model(),
         system_prompt=config.SYSTEM_PROMPT,
         tools=tools,
@@ -398,6 +459,8 @@ def _construct_agent(session_id: str, actor_id: str) -> Agent:
         session_manager=session_manager,
         trace_attributes=_trace_attributes(session_id, actor_id),
     )
+    _install_truncation_guard(agent)
+    return agent
 
 
 def create_agent(session_id: Optional[str] = None, actor_id: str = "user") -> Agent:
