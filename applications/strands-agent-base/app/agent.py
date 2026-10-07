@@ -161,22 +161,35 @@ _MCP_WARMUP_MAX_ATTEMPTS = int(os.getenv("MCP_CONNECT_MAX_ATTEMPTS", "12"))
 _MCP_WARMUP_MAX_WAIT = int(os.getenv("MCP_CONNECT_MAX_WAIT", "30"))
 
 
-def _no_retry_error(exc: BaseException) -> bool:
-    """True for errors a warm-up retry must NOT repeat (HTTP 401/403/404).
+# HTTP statuses whose connect failures a warm-up retry must NOT repeat.
+_NO_RETRY_STATUSES = frozenset({401, 403, 404})
 
-    Auth/not-found failures will not fix themselves by waiting, so retrying
-    them just burns a background thread. Walks the exception chain for an HTTP
-    response status without importing httpx.
+
+class _NonRetryableConnectError(Exception):
+    """An MCP connect that must NOT be retried (gateway returned 401/403/404).
+
+    Auth/not-found failures do not fix themselves by waiting, so a warm-up
+    retry would just burn a background thread. _build_client raises this when
+    its httpx response hook observed such a status for the attempt; it carries
+    the status for logging and chains the underlying transport error as cause.
     """
-    seen: set = set()
-    cur: Optional[BaseException] = exc
-    while cur is not None and id(cur) not in seen:
-        seen.add(id(cur))
-        status = getattr(getattr(cur, "response", None), "status_code", None)
-        if status in (401, 403, 404):
-            return True
-        cur = cur.__cause__ or cur.__context__
-    return False
+
+    def __init__(self, status: int):
+        super().__init__(f"non-retryable MCP connect (HTTP {status})")
+        self.status = status
+
+
+def _no_retry_error(exc: BaseException) -> bool:
+    """True for a connect error a warm-up retry must NOT repeat.
+
+    The live MCP stack wraps a transport failure into an opaque
+    MCPError(-32603) that carries no HTTP status, so the status cannot be
+    recovered by walking the exception chain. Instead _build_client observes
+    the raw HTTP response via an httpx event hook and re-raises as
+    _NonRetryableConnectError when the gateway returned 401/403/404 — this
+    predicate simply recognises that marker.
+    """
+    return isinstance(exc, _NonRetryableConnectError)
 
 
 def _build_client(pool: "_McpPool", url: str) -> MCPClient:
@@ -184,25 +197,49 @@ def _build_client(pool: "_McpPool", url: str) -> MCPClient:
 
     Runs under a detached OTEL context so the transport's background loop does
     not capture the active request span (see _detached_otel_context). On any
-    failure the half-started client is closed so nothing leaks, and the error
-    propagates for the caller to decide on a background warm-up. The pool lock
-    guards the clients/tools mutation against concurrent warm-up threads.
+    failure the half-started client is closed so nothing leaks. The real HTTP
+    status is observed via an httpx *response* event hook attached to the
+    transport's client — the MCP stack otherwise wraps a 401/403/404 into an
+    opaque MCPError(-32603) with no status, so this hook is the only reliable
+    place to see it before it is swallowed. If the gateway returned a
+    non-retryable status, the error is re-raised as _NonRetryableConnectError
+    so the caller skips the background warm-up. The pool lock guards the
+    clients/tools mutation against concurrent warm-up threads.
     """
-    client = MCPClient(
-        lambda u=url, p=pool: streamable_http_client(
-            u, http_client=create_mcp_http_client(headers=p.headers())
-        )
-    )
+    seen_status: dict = {}
+
+    async def _record_status(response) -> None:
+        # Observational only: record the first auth/not-found status so the
+        # connect-failure handler can classify it. Must never raise.
+        try:
+            code = getattr(response, "status_code", None)
+            if code in _NO_RETRY_STATUSES and "status" not in seen_status:
+                seen_status["status"] = code
+        except Exception:
+            pass
+
+    def _transport(u=url, p=pool):
+        http_client = create_mcp_http_client(headers=p.headers())
+        # Append our hook (do not clobber any the SDK may have registered).
+        hooks = dict(getattr(http_client, "event_hooks", {}) or {})
+        hooks["response"] = [*hooks.get("response", []), _record_status]
+        http_client.event_hooks = hooks
+        return streamable_http_client(u, http_client=http_client)
+
+    client = MCPClient(_transport)
     try:
         with _detached_otel_context():
             client.start()
             server_tools = client.list_tools_sync()
-    except Exception:
+    except Exception as exc:
         try:
             with _detached_otel_context():
                 client.stop(None, None, None)
         except Exception:
             pass
+        status = seen_status.get("status")
+        if status is not None:
+            raise _NonRetryableConnectError(status) from exc
         raise
     with pool.lock:
         pool.clients.append(client)

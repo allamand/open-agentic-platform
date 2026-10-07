@@ -21,22 +21,22 @@ def _join_warmups(timeout: float = 5.0) -> None:
 
 
 class _FakeResponse:
+    """Minimal stand-in for an httpx.Response, carrying only .status_code —
+    enough to drive the app's response event hook in tests."""
+
     def __init__(self, status_code: int):
         self.status_code = status_code
-
-
-class _FakeHTTPStatus(Exception):
-    """Stand-in for an httpx.HTTPStatusError, carrying .response.status_code."""
-
-    def __init__(self, status_code: int):
-        super().__init__(f"HTTP {status_code}")
-        self.response = _FakeResponse(status_code)
 
 
 @pytest.fixture(autouse=True)
 def isolated_agent_state(monkeypatch, tmp_path):
     """Fake MCP transport, one configured server, and empty pools per test."""
     transport_calls: list = []
+    # Tests may set control["fire_status"] = <int> to make the fake transport
+    # drive the app's real httpx response hook with that HTTP status, mirroring
+    # how the live gateway surfaces a status (the MCP stack then wraps the
+    # failure into an opaque error carrying no status).
+    control: dict = {}
 
     def fake_transport(url, http_client=None):
         raw = dict(getattr(http_client, "headers", None) or {})
@@ -44,6 +44,13 @@ def isolated_agent_state(monkeypatch, tmp_path):
         # to "Authorization" (matching identity.py's own header construction).
         headers = {"Authorization": raw["authorization"]} if "authorization" in raw else {}
         transport_calls.append((url, headers))
+        fire = control.get("fire_status")
+        if fire is not None and http_client is not None:
+            import asyncio
+
+            response = _FakeResponse(fire)
+            for hook in (getattr(http_client, "event_hooks", None) or {}).get("response", []):
+                asyncio.run(hook(response))
         return object()
 
     class FakeClient:
@@ -78,7 +85,7 @@ def isolated_agent_state(monkeypatch, tmp_path):
     monkeypatch.setenv("WORKLOAD_TOKEN_PATH", str(sa))
 
     token = inbound_auth.set(None)
-    yield {"calls": transport_calls, "clients": FakeClient, "sa": sa}
+    yield {"calls": transport_calls, "clients": FakeClient, "sa": sa, "control": control}
     inbound_auth.reset(token)
 
 
@@ -241,13 +248,20 @@ def test_connect_retries_in_background_through_transient_failure(monkeypatch, is
 
 def test_a_non_retryable_connect_error_is_not_warmed_up(monkeypatch, isolated_agent_state):
     """401/403/404 will not fix themselves by waiting, so no background warm-up
-    is spawned: exactly one synchronous attempt, then the server is dropped."""
+    is spawned: exactly one synchronous attempt, then the server is dropped.
+
+    The status is observed through the real httpx *response* event hook the app
+    attaches to the transport's client — mirroring how the live MCP stack
+    surfaces it — not a fabricated exception shape. The live SDK wraps a
+    transport failure into an opaque MCPError(-32603) with no HTTP status, so
+    the raised error here is deliberately opaque; only the hook carries 401."""
     monkeypatch.setattr(agent_mod, "_MCP_WARMUP_MAX_ATTEMPTS", 5)
+    isolated_agent_state["control"]["fire_status"] = 401
 
     class Unauthorized(isolated_agent_state["clients"]):
         def start(self):
-            super().start()
-            raise RuntimeError("401 Unauthorized") from _FakeHTTPStatus(401)
+            super().start()  # drives the response hook (401) via fake_transport
+            raise RuntimeError("MCP initialize failed")  # opaque, no HTTP status
 
     monkeypatch.setattr(agent_mod, "MCPClient", Unauthorized)
     _, tools = _tools_for("Bearer alice.jwt")
@@ -255,3 +269,25 @@ def test_a_non_retryable_connect_error_is_not_warmed_up(monkeypatch, isolated_ag
 
     assert tools == []
     assert len(isolated_agent_state["clients"].instances) == 1, "no background retry on 401/403/404"
+
+
+def test_a_retryable_http_status_still_warms_up(monkeypatch, isolated_agent_state):
+    """A 5xx observed via the hook is transient (gateway up before the backend
+    Deployment is Ready), so the background warm-up still runs — only 401/403/404
+    are treated as non-retryable. Guards against the hook over-classifying."""
+    monkeypatch.setattr(agent_mod, "_MCP_WARMUP_MAX_ATTEMPTS", 2)
+    isolated_agent_state["control"]["fire_status"] = 503
+
+    class ServerError(isolated_agent_state["clients"]):
+        def start(self):
+            super().start()  # drives the response hook (503) via fake_transport
+            raise RuntimeError("gateway 503: backend warming up")
+
+    monkeypatch.setattr(agent_mod, "MCPClient", ServerError)
+    _, tools = _tools_for("Bearer alice.jwt")
+    _join_warmups()
+
+    assert tools == []
+    assert len(isolated_agent_state["clients"].instances) == 1 + 2, (
+        "1 synchronous attempt + 2 background attempts (503 is retryable)"
+    )
