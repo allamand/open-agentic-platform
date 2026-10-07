@@ -4,6 +4,7 @@ import hashlib
 import logging
 import os
 import re
+import threading
 import time
 import uuid
 from contextlib import contextmanager
@@ -26,7 +27,7 @@ from strands.agent.agent_result import AgentResult
 from strands.models.openai import OpenAIModel
 from strands.tools.mcp.mcp_client import MCPClient
 from strands.types.exceptions import MaxTokensReachedException
-from tenacity import retry, retry_if_exception, stop_after_attempt, wait_exponential, before_sleep_log, Retrying
+from tenacity import retry, retry_if_exception, stop_after_attempt, wait_exponential, before_sleep_log
 
 try:
     from strands.multiagent.a2a.server import _AGENT_CARD_CONTEXT_ID
@@ -54,18 +55,18 @@ _pools: dict = {}
 # currently 1h). The kubelet rewrites the file before it expires, but an open
 # connection does not re-read it, so a long-lived workload pool would eventually
 # call tools with an expired credential. Recycle the pool well inside that
-# lifetime by rebuilding it: close the old MCPClients and open fresh ones, which
-# re-invokes the transport callable and therefore the headers provider so the new
-# connections carry the rotated token.
+# lifetime by restarting each MCPClient in place: stop() then start() on the
+# same instance. strands' MCPClient is restartable — stop() resets its state
+# "to allow instance reuse" and start() re-invokes the transport callable (and
+# therefore the headers provider), so the reconnected session carries the
+# rotated token without creating new client objects.
 #
-# We do NOT stop()+start() the same MCPClient in place: strands' MCPClient is not
-# restartable — stop() tears down its background event loop, so a subsequent
-# start() on the same instance fails with "Connection to the MCP server was
-# closed" (and orphans the close-event coroutine), leaving a dead connection that
-# every bound tool then calls into. Rebuilding sidesteps that entirely; cached
-# agents that bound to the old clients are invalidated on recycle (see
-# _invalidate_agents), and their conversation state is unaffected because it lives
-# in AgentCore Memory keyed by session id.
+# In-place restart (rather than rebuilding with fresh client objects) is
+# deliberate: the A2A server and cached agents hold tool objects bound to
+# specific MCPClient instances. Preserving object identity keeps those
+# references valid across a recycle; rebuilding would leave them bound to
+# closed clients and every bound tool call would then fail with
+# MCPClientInitializationError.
 #
 # Caller pools need no equivalent: their key is derived from the credential, so a
 # refreshed caller token yields a new pool instead of a stale one.
@@ -88,6 +89,8 @@ class _McpPool:
         self.clients: list = []
         self.tools: list = []
         self.connected_at: float = 0.0
+        # Guards clients/tools mutation from background warm-up threads (_open).
+        self.lock = threading.Lock()
 
 
 def _is_access_denied(exc: BaseException) -> bool:
@@ -146,74 +149,109 @@ def _detached_otel_context():
 # On a fresh cluster the agent pod can become Ready before an MCP backend (or
 # its agentgateway route) is — the connect then fails one-shot (typically a
 # transient HTTP 500 from the gateway before the backend Deployment is Ready).
-# The original single-attempt connect dropped that server's tools *permanently*
-# and the partial pool was cached, so the agent stayed half-blind (e.g. only
-# skills-mcp, missing eks-read-mcp/gitlab-mcp) until a manual pod restart.
-# Retry each server with bounded exponential backoff so a first-boot ordering
-# race self-resolves without any manual intervention. Defaults (~12 attempts,
-# 30s cap ≈ 3.5 min total) comfortably exceed the observed warm-up gap; both are
-# env-tunable. A genuinely-down server still fails after the budget and is
-# logged, without blocking the other servers.
-_MCP_CONNECT_MAX_ATTEMPTS = int(os.getenv("MCP_CONNECT_MAX_ATTEMPTS", "12"))
-_MCP_CONNECT_MAX_WAIT = int(os.getenv("MCP_CONNECT_MAX_WAIT", "30"))
+# We must NOT retry that synchronously: _open runs at startup AND in the request
+# path (via _get_mcp_tools), so a blocking retry would freeze the asyncio event
+# loop — the liveness/health probe and every other caller with it — for the
+# whole budget, and one unreachable server could crash-loop the pod. Instead the
+# connect makes ONE fast attempt; if a server is merely warming up (a retryable
+# error — not 401/403/404), a bounded background thread keeps trying and adds its
+# tools to the pool once it comes up. The agent starts promptly with whatever
+# tools are ready and heals as backends appear, never blocking startup/requests.
+_MCP_WARMUP_MAX_ATTEMPTS = int(os.getenv("MCP_CONNECT_MAX_ATTEMPTS", "12"))
+_MCP_WARMUP_MAX_WAIT = int(os.getenv("MCP_CONNECT_MAX_WAIT", "30"))
 
 
-def _connect_one(pool: _McpPool, url: str) -> MCPClient:
-    """Open one MCP connection and load its tools, retrying through warm-up.
+def _no_retry_error(exc: BaseException) -> bool:
+    """True for errors a warm-up retry must NOT repeat (HTTP 401/403/404).
 
-    Retries any failure (gateway 500, connection refused, list_tools error)
-    with bounded exponential backoff. On a failed attempt the half-started
-    client is closed before the next try so retries do not leak connections.
-    Tools are appended to the pool only once, on the successful attempt. The
-    connect runs under a detached OTEL context so the transport's background
-    loop does not capture the active request span (see _detached_otel_context).
-
-    The retry controller is built per call so the ``_MCP_CONNECT_*`` budget
-    stays monkeypatchable (tests set wait=0 / attempts=1).
+    Auth/not-found failures will not fix themselves by waiting, so retrying
+    them just burns a background thread. Walks the exception chain for an HTTP
+    response status without importing httpx.
     """
+    seen: set = set()
+    cur: Optional[BaseException] = exc
+    while cur is not None and id(cur) not in seen:
+        seen.add(id(cur))
+        status = getattr(getattr(cur, "response", None), "status_code", None)
+        if status in (401, 403, 404):
+            return True
+        cur = cur.__cause__ or cur.__context__
+    return False
 
-    def _attempt() -> MCPClient:
-        # headers travel on a pre-built httpx client (mcp SDK via strands 1.57.0)
-        client = MCPClient(
-            lambda u=url, p=pool: streamable_http_client(
-                u, http_client=create_mcp_http_client(headers=p.headers())
-            )
+
+def _build_client(pool: "_McpPool", url: str) -> MCPClient:
+    """Open one MCP connection and append its tools to *pool* (single attempt).
+
+    Runs under a detached OTEL context so the transport's background loop does
+    not capture the active request span (see _detached_otel_context). On any
+    failure the half-started client is closed so nothing leaks, and the error
+    propagates for the caller to decide on a background warm-up. The pool lock
+    guards the clients/tools mutation against concurrent warm-up threads.
+    """
+    client = MCPClient(
+        lambda u=url, p=pool: streamable_http_client(
+            u, http_client=create_mcp_http_client(headers=p.headers())
         )
+    )
+    try:
+        with _detached_otel_context():
+            client.start()
+            server_tools = client.list_tools_sync()
+    except Exception:
         try:
             with _detached_otel_context():
-                client.start()
-                server_tools = client.list_tools_sync()
+                client.stop(None, None, None)
         except Exception:
-            try:
-                with _detached_otel_context():
-                    client.stop(None, None, None)
-            except Exception:
-                pass
-            raise
-        logger.info(f"  Loaded {len(server_tools)} tools from {url}")
+            pass
+        raise
+    with pool.lock:
+        pool.clients.append(client)
         pool.tools.extend(server_tools)
-        return client
-
-    retryer = Retrying(
-        wait=wait_exponential(multiplier=1, max=_MCP_CONNECT_MAX_WAIT),
-        stop=stop_after_attempt(_MCP_CONNECT_MAX_ATTEMPTS),
-        before_sleep=before_sleep_log(logger, logging.WARNING),
-        reraise=True,
-    )
-    return retryer(_attempt)
+    logger.info(f"  Loaded {len(server_tools)} tools from {url}")
+    return client
 
 
-def _open(pool: _McpPool, urls: list) -> None:
+def _warm_up_later(pool: "_McpPool", url: str) -> None:
+    """Retry a not-yet-ready MCP server in a background daemon thread.
+
+    Bounded exponential backoff; stops on success, on a non-retryable error
+    (401/403/404), or when the budget is exhausted. Tools added here are seen by
+    agents created after the server comes up (existing agents keep the tool set
+    they were built with). Never runs on the startup or request path.
+    """
+
+    def _run() -> None:
+        delay = 1.0
+        for attempt in range(1, _MCP_WARMUP_MAX_ATTEMPTS + 1):
+            time.sleep(min(delay, _MCP_WARMUP_MAX_WAIT))
+            try:
+                _build_client(pool, url)
+                logger.info(f"MCP server {url} came up (background attempt {attempt})")
+                return
+            except Exception as exc:
+                if _no_retry_error(exc):
+                    logger.warning(f"  Giving up on MCP server {url} (non-retryable): {exc}")
+                    return
+                logger.warning(f"  MCP server {url} still unavailable (attempt {attempt}): {exc}")
+                delay *= 2
+        logger.warning(
+            f"  MCP server {url} did not come up after {_MCP_WARMUP_MAX_ATTEMPTS} background attempts"
+        )
+
+    threading.Thread(target=_run, name=f"mcp-warmup-{url}", daemon=True).start()
+
+
+def _open(pool: "_McpPool", urls: list) -> None:
     for url in urls:
         logger.info(f"Connecting to MCP server: {url}")
         try:
-            client = _connect_one(pool, url)
-            pool.clients.append(client)
+            _build_client(pool, url)  # one fast attempt — never blocks
         except Exception as exc:
-            logger.warning(
-                f"  Failed to connect to MCP server {url} after "
-                f"{_MCP_CONNECT_MAX_ATTEMPTS} attempts: {exc}"
-            )
+            if _no_retry_error(exc):
+                logger.warning(f"  Failed to connect to MCP server {url} (non-retryable): {exc}")
+            else:
+                logger.warning(f"  MCP server {url} not ready, warming up in background: {exc}")
+                _warm_up_later(pool, url)
     pool.connected_at = time.monotonic()
 
 
@@ -247,16 +285,19 @@ def _get_mcp_tools(key: str, headers: HeadersProvider) -> list:
             "Recycling %d workload MCP connection(s) to pick up the rotated token",
             len(pool.clients),
         )
-        # Rebuild rather than restart in place: MCPClient is not restartable
-        # (stop() kills its event loop; a same-instance start() then fails and
-        # leaves a dead connection). _close + _open yields fresh clients whose
-        # headers provider re-reads the rotated token.
-        _close(pool)
-        pool.tools = []
-        _open(pool, urls)
-        # Cached agents hold tool objects bound to the just-closed clients, so
-        # drop them: get_or_create_agent will rebuild against the fresh pool.
-        _invalidate_agents()
+        # Restart each client in place (stop() then start() on the SAME
+        # instance): start() re-invokes the transport callable so the rotated
+        # token is re-read, while object identity is preserved so tool objects
+        # held by the A2A server and cached agents stay valid. Detached OTEL
+        # context keeps the teardown/reconnect spans off the request trace.
+        for client in pool.clients:
+            try:
+                with _detached_otel_context():
+                    client.stop(None, None, None)
+                    client.start()
+            except Exception as exc:
+                logger.warning(f"  Failed to recycle MCP connection: {exc}")
+        pool.connected_at = time.monotonic()
 
     # Re-insert last so dict insertion order doubles as the LRU order.
     _pools[key] = pool
@@ -285,15 +326,20 @@ def _sanitize_agentcore_id(value: str) -> str:
 
     Invalid characters become '-'; the result is guaranteed to start with an
     alphanumeric character and to be at most ``_AGENTCORE_ID_MAX_LEN`` chars.
-    When truncation is required a short deterministic hash of the original is
-    appended so distinct inputs keep distinct ids (no memory cross-talk).
+    A short deterministic hash of the original is appended whenever sanitizing
+    changes the id (not only on truncation), so distinct inputs that collapse to
+    the same cleaned string keep distinct ids (no memory cross-talk). An
+    already-valid id is returned byte-identical.
     """
-    cleaned = _AGENTCORE_ID_INVALID.sub("-", value or "")
+    original = value or ""
+    cleaned = _AGENTCORE_ID_INVALID.sub("-", original)
+    changed = cleaned != original
     if not cleaned or not cleaned[0].isalnum():
         cleaned = "s-" + cleaned.lstrip("-_")
-    if len(cleaned) > _AGENTCORE_ID_MAX_LEN:
-        digest = hashlib.sha1(value.encode("utf-8")).hexdigest()[:12]
-        cleaned = cleaned[: _AGENTCORE_ID_MAX_LEN - 1 - len(digest)] + "-" + digest
+        changed = True
+    if changed or len(cleaned) > _AGENTCORE_ID_MAX_LEN:
+        digest = hashlib.sha1(original.encode("utf-8")).hexdigest()[:12]
+        cleaned = cleaned[: _AGENTCORE_ID_MAX_LEN - 1 - len(digest)].rstrip("-_") + "-" + digest
     return cleaned
 
 
@@ -479,20 +525,6 @@ def create_agent(session_id: Optional[str] = None, actor_id: str = "user") -> Ag
 # ── session cache ────────────────────────────────────────────────────────
 
 _agents: dict[tuple, Agent] = {}
-
-
-def _invalidate_agents() -> None:
-    """Drop all cached agents after a workload MCP pool rebuild.
-
-    Cached agents bind to the tool objects of MCPClient instances that a recycle
-    has just closed, so calling them would hit dead connections. Clearing the
-    cache makes get_or_create_agent reconstruct them against the fresh pool on
-    next use. Conversation state is preserved: it lives in AgentCore Memory keyed
-    by session id, which the rebuilt agent's session manager reloads.
-    """
-    if _agents:
-        logger.info("Invalidating %d cached agent(s) after workload MCP recycle", len(_agents))
-        _agents.clear()
 
 
 def get_or_create_agent(session_id: Optional[str] = None, actor_id: str = "user") -> tuple[Agent, str]:

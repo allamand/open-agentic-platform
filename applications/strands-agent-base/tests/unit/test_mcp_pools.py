@@ -4,11 +4,33 @@ The behaviour under test is isolation: an MCP connection binds its credential
 when it opens, so two callers must never share one.
 """
 
+import threading
+
 import pytest
 
 from app import agent as agent_mod
 from app.config import config
 from app.identity import WORKLOAD_KEY, inbound_auth, outbound
+
+
+def _join_warmups(timeout: float = 5.0) -> None:
+    """Wait for any background MCP warm-up threads spawned by _open to finish."""
+    for t in threading.enumerate():
+        if t.name.startswith("mcp-warmup-"):
+            t.join(timeout)
+
+
+class _FakeResponse:
+    def __init__(self, status_code: int):
+        self.status_code = status_code
+
+
+class _FakeHTTPStatus(Exception):
+    """Stand-in for an httpx.HTTPStatusError, carrying .response.status_code."""
+
+    def __init__(self, status_code: int):
+        super().__init__(f"HTTP {status_code}")
+        self.response = _FakeResponse(status_code)
 
 
 @pytest.fixture(autouse=True)
@@ -48,8 +70,8 @@ def isolated_agent_state(monkeypatch, tmp_path):
     monkeypatch.setattr(agent_mod, "MCPClient", FakeClient)
     monkeypatch.setattr(config, "MCP_SERVER_NAMES_RAW", "mcp-time")
     monkeypatch.setattr(agent_mod, "_pools", {})
-    # Keep the connect-retry budget exercised but instant (no real backoff).
-    monkeypatch.setattr(agent_mod, "_MCP_CONNECT_MAX_WAIT", 0)
+    # Keep the warm-up retry exercised but instant (cap every sleep at 0).
+    monkeypatch.setattr(agent_mod, "_MCP_WARMUP_MAX_WAIT", 0)
 
     sa = tmp_path / "token"
     sa.write_text("sa-token-v1")
@@ -114,12 +136,12 @@ def test_workload_pool_recycles_and_rereads_the_rotated_token(isolated_agent_sta
     _tools_for(None)
 
     instances = isolated_agent_state["clients"].instances
-    # Recycle REBUILDS the pool (MCPClient is not restartable): the old client
-    # is closed, not restarted in place, and a fresh client is opened whose
-    # headers provider re-reads the rotated token.
-    assert client.stops == 1 and client.starts == 1, "old client closed, not restarted in place"
-    assert len(instances) == 2 and instances[0] is client, "pool rebuilt with a fresh client"
-    assert instances[1].starts == 1, "fresh client started once"
+    # Recycle restarts the SAME client in place (MCPClient is restartable):
+    # stop() then start() on the same instance, which re-invokes the transport
+    # and re-reads the rotated token. Object identity is preserved so no new
+    # client is created — tool objects held by callers stay valid.
+    assert client.stops == 1 and client.starts == 2, "same client restarted in place"
+    assert len(instances) == 1 and instances[0] is client, "no new client object"
     _, headers = isolated_agent_state["calls"][-1]
     assert headers["Authorization"] == "Bearer sa-token-v2"
 
@@ -170,7 +192,7 @@ def test_shutdown_closes_every_pool(isolated_agent_state):
 
 
 def test_connect_failure_is_contained(monkeypatch, isolated_agent_state):
-    monkeypatch.setattr(agent_mod, "_MCP_CONNECT_MAX_ATTEMPTS", 3)
+    monkeypatch.setattr(agent_mod, "_MCP_WARMUP_MAX_ATTEMPTS", 2)
 
     class Failing(isolated_agent_state["clients"]):
         def start(self):
@@ -179,21 +201,25 @@ def test_connect_failure_is_contained(monkeypatch, isolated_agent_state):
 
     monkeypatch.setattr(agent_mod, "MCPClient", Failing)
     _, tools = _tools_for("Bearer alice.jwt")
+    _join_warmups()
 
-    # A persistently-failing server exhausts its bounded retry budget, is
-    # logged, and leaves the agent with no tools from it — without raising.
+    # The synchronous connect makes exactly ONE fast attempt (never blocking the
+    # event loop on a down server), the agent gets no tools from it and does NOT
+    # raise; a bounded background warm-up then retries to its budget and gives up.
     assert tools == []
-    assert len(isolated_agent_state["clients"].instances) == 3, "retried to budget"
-    assert all(c.stops == 1 for c in isolated_agent_state["clients"].instances), (
+    instances = isolated_agent_state["clients"].instances
+    assert len(instances) == 1 + 2, "1 synchronous attempt + 2 background attempts"
+    assert all(c.stops == 1 for c in instances), (
         "each failed attempt closes its half-started client"
     )
 
 
-def test_connect_retries_through_transient_failure(monkeypatch, isolated_agent_state):
-    """A first-boot warm-up race (gateway 500 before the backend is Ready)
-    must self-resolve: the connect retries and the agent ends up with tools,
-    never a cached half-blind pool that needs a manual restart."""
-    monkeypatch.setattr(agent_mod, "_MCP_CONNECT_MAX_ATTEMPTS", 5)
+def test_connect_retries_in_background_through_transient_failure(monkeypatch, isolated_agent_state):
+    """A first-boot warm-up race (gateway 500 before the backend is Ready) must
+    self-resolve WITHOUT blocking: the synchronous connect makes one fast
+    attempt, then a background warm-up retries until the backend is Ready and
+    adds its tools to the pool — no cached half-blind pool needing a restart."""
+    monkeypatch.setattr(agent_mod, "_MCP_WARMUP_MAX_ATTEMPTS", 5)
 
     class FlakyThenOk(isolated_agent_state["clients"]):
         attempts = 0
@@ -205,8 +231,27 @@ def test_connect_retries_through_transient_failure(monkeypatch, isolated_agent_s
                 raise RuntimeError("gateway 500: backend warming up")
 
     monkeypatch.setattr(agent_mod, "MCPClient", FlakyThenOk)
-    key, tools = _tools_for("Bearer alice.jwt")
+    key, _ = _tools_for("Bearer alice.jwt")
+    _join_warmups()
 
-    assert tools, "tools loaded after transient failures"
-    assert FlakyThenOk.attempts == 3, "retried until the backend was Ready"
+    assert FlakyThenOk.attempts == 3, "one fast sync attempt, then background retries until Ready"
+    assert agent_mod._pools[key].tools, "tools added to the pool once the backend came up"
     assert len(agent_mod._pools[key].clients) == 1, "exactly one live client pooled"
+
+
+def test_a_non_retryable_connect_error_is_not_warmed_up(monkeypatch, isolated_agent_state):
+    """401/403/404 will not fix themselves by waiting, so no background warm-up
+    is spawned: exactly one synchronous attempt, then the server is dropped."""
+    monkeypatch.setattr(agent_mod, "_MCP_WARMUP_MAX_ATTEMPTS", 5)
+
+    class Unauthorized(isolated_agent_state["clients"]):
+        def start(self):
+            super().start()
+            raise RuntimeError("401 Unauthorized") from _FakeHTTPStatus(401)
+
+    monkeypatch.setattr(agent_mod, "MCPClient", Unauthorized)
+    _, tools = _tools_for("Bearer alice.jwt")
+    _join_warmups()
+
+    assert tools == []
+    assert len(isolated_agent_state["clients"].instances) == 1, "no background retry on 401/403/404"
