@@ -4,6 +4,11 @@ global:
   # ALB (e.g. by CloudFront). Set from the cluster secret's insecure annotation,
   # same convention as the keycloak/argo-workflows charts.
   insecure: "false"
+  # Resource prefix of this deployment (e.g. "peeks"). Used by push-otel-secret.yaml
+  # to name the OTEL SM secret <resourcePrefix>-hub/langfuse-otel so two events with
+  # different prefixes in one AWS account don't collide. Set from the registry entry's
+  # valuesObject.global.resourcePrefix (cluster-secret resource_prefix annotation).
+  resourcePrefix: ""
 
 clusterName: ""
 
@@ -148,8 +153,10 @@ seed:
   orgName: "Agent Platform"
   projectId: "proj-agent-platform"
   projectName: "agent-platform"
-  # Secrets Manager path where OTEL keys are stored
-  secretManagerPath: "hub/langfuse-otel"
+  # Secrets Manager path where OTEL keys are stored. The actual path is built in
+  # push-otel-secret.yaml as "<global.resourcePrefix>-hub/langfuse-otel" (prefix-scoped
+  # to avoid cross-event collisions in a shared account); this default is documentation only.
+  secretManagerPath: "<resourcePrefix>-hub/langfuse-otel"
   apiKey:
     id: "ak-otel-collector"
     publicKey: "pk-lf-otel-platform"
