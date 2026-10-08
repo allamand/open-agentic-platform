@@ -291,3 +291,42 @@ def test_a_retryable_http_status_still_warms_up(monkeypatch, isolated_agent_stat
     assert len(isolated_agent_state["clients"].instances) == 1 + 2, (
         "1 synchronous attempt + 2 background attempts (503 is retryable)"
     )
+
+
+def test_readiness_gate_refuses_autonomous_on_incomplete_toolset(monkeypatch, isolated_agent_state):
+    """§7.1: the autonomous (workload) path must refuse to act when a required MCP
+    server is not connected, rather than open a remediation MR half-blind."""
+    monkeypatch.setattr(agent_mod, "_MCP_WARMUP_MAX_ATTEMPTS", 1)
+
+    class Failing(isolated_agent_state["clients"]):
+        def start(self):
+            super().start()
+            raise RuntimeError("connect refused")
+
+    monkeypatch.setattr(agent_mod, "MCPClient", Failing)
+    with pytest.raises(agent_mod.AgentNotReadyError):
+        _tools_for(None)  # None caller -> WORKLOAD_KEY (autonomous path)
+    _join_warmups()
+
+
+def test_readiness_gate_does_not_block_chat_on_incomplete_toolset(monkeypatch, isolated_agent_state):
+    """Chat (caller-keyed) pools are NOT gated: an incomplete toolset degrades
+    gracefully (empty tools) instead of refusing."""
+    monkeypatch.setattr(agent_mod, "_MCP_WARMUP_MAX_ATTEMPTS", 1)
+
+    class Failing(isolated_agent_state["clients"]):
+        def start(self):
+            super().start()
+            raise RuntimeError("connect refused")
+
+    monkeypatch.setattr(agent_mod, "MCPClient", Failing)
+    _, tools = _tools_for("Bearer alice.jwt")  # caller key, not workload
+    _join_warmups()
+    assert tools == []
+
+
+def test_readiness_gate_passes_when_all_required_connected(isolated_agent_state):
+    """When every required server is connected, the workload path returns tools."""
+    key, tools = _tools_for(None)  # WORKLOAD_KEY, single server connects OK
+    assert key == WORKLOAD_KEY
+    assert tools, "all required servers connected -> tools returned, no refusal"

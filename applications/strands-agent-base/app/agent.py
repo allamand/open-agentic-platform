@@ -88,6 +88,9 @@ class _McpPool:
         self.headers = headers
         self.clients: list = []
         self.tools: list = []
+        # URLs that successfully connected (populated by _build_client). The
+        # readiness gate (§7.1) checks this against the required set.
+        self.connected_urls: set = set()
         self.connected_at: float = 0.0
         # Guards clients/tools mutation from background warm-up threads (_open).
         self.lock = threading.Lock()
@@ -244,6 +247,7 @@ def _build_client(pool: "_McpPool", url: str) -> MCPClient:
     with pool.lock:
         pool.clients.append(client)
         pool.tools.extend(server_tools)
+        pool.connected_urls.add(url)
     logger.info(f"  Loaded {len(server_tools)} tools from {url}")
     return client
 
@@ -304,6 +308,32 @@ def _close(pool: _McpPool) -> None:
     pool.clients = []
 
 
+# Readiness gate (§7.1): when enabled, the AUTONOMOUS (workload) path refuses to
+# act unless every REQUIRED MCP server is connected — the agent must not open a
+# remediation MR on an incomplete toolset (half-blind RCA). Chat is never gated
+# (it degrades gracefully). Disable with MCP_READINESS_GATE=false.
+_MCP_READINESS_GATE = os.getenv("MCP_READINESS_GATE", "true").lower() not in ("0", "false", "no")
+
+
+class AgentNotReadyError(RuntimeError):
+    """The readiness gate refused: the autonomous path's required MCP servers are
+    not all connected, so the agent declines to produce remediation on an
+    incomplete toolset. Transient — the incident's SQS redelivery retries once the
+    backends warm up (the one-shot connect + background warm-up heal the pool)."""
+
+
+def _required_mcp_urls() -> set:
+    """URLs the autonomous (workload) path requires before it may act. Default:
+    every configured MCP server (strict — refuse on an incomplete toolset).
+    Override with MCP_REQUIRED_SERVERS (comma-separated server names) to require
+    only a subset (e.g. just the gitlab + eks-read servers)."""
+    all_urls = list(config.MCP_SERVER_URLS)
+    names = [n.strip() for n in os.getenv("MCP_REQUIRED_SERVERS", "").split(",") if n.strip()]
+    if not names:
+        return set(all_urls)
+    return {u for u in all_urls for n in names if u.rstrip("/").endswith(f"/mcp/{n}")}
+
+
 def _get_mcp_tools(key: str, headers: HeadersProvider) -> list:
     """Tools from the MCP pool for *key*, connecting or recycling as needed."""
     urls = config.MCP_SERVER_URLS
@@ -341,6 +371,21 @@ def _get_mcp_tools(key: str, headers: HeadersProvider) -> list:
     while len(_pools) > _MAX_MCP_POOLS:
         logger.info("Closing least recently used MCP pool (max %d)", _MAX_MCP_POOLS)
         _close(_pools.pop(next(iter(_pools))))
+
+    # Readiness gate (§7.1): the AUTONOMOUS (workload) path must not act on an
+    # incomplete toolset. If a required MCP server never connected (still warming
+    # up or genuinely down), refuse — do NOT open a remediation MR half-blind.
+    # Caller (chat) pools are intentionally not gated.
+    if _MCP_READINESS_GATE and key == WORKLOAD_KEY:
+        required = _required_mcp_urls()
+        missing = required - pool.connected_urls
+        if missing:
+            names = sorted(u.rsplit("/mcp/", 1)[-1] for u in missing)
+            raise AgentNotReadyError(
+                "readiness gate: required MCP server(s) not connected: "
+                f"{', '.join(names)}; refusing autonomous remediation on an "
+                f"incomplete toolset (connected {len(pool.connected_urls)}/{len(required)})"
+            )
 
     return pool.tools
 
