@@ -322,6 +322,15 @@ class AgentNotReadyError(RuntimeError):
     backends warm up (the one-shot connect + background warm-up heal the pool)."""
 
 
+def _mcp_server_name(url: str) -> str:
+    """Canonical server name for an MCP URL: the segment after '/mcp/' when present,
+    else the last non-empty path segment. Robust to URLs not shaped as /mcp/<name>."""
+    path = url.rstrip("/")
+    if "/mcp/" in path:
+        return path.rsplit("/mcp/", 1)[-1]
+    return path.rsplit("/", 1)[-1]
+
+
 def _required_mcp_urls() -> set:
     """URLs the autonomous (workload) path requires before it may act. Default:
     every configured MCP server (strict — refuse on an incomplete toolset).
@@ -331,7 +340,18 @@ def _required_mcp_urls() -> set:
     names = [n.strip() for n in os.getenv("MCP_REQUIRED_SERVERS", "").split(",") if n.strip()]
     if not names:
         return set(all_urls)
-    return {u for u in all_urls for n in names if u.rstrip("/").endswith(f"/mcp/{n}")}
+    by_name = {_mcp_server_name(u): u for u in all_urls}
+    required = {by_name[n] for n in names if n in by_name}
+    unknown = [n for n in names if n not in by_name]
+    if unknown:
+        # A requested name that matches no configured server would otherwise be
+        # silently dropped from the required set, quietly weakening the gate — warn.
+        logger.warning(
+            "MCP_REQUIRED_SERVERS name(s) %s not among configured MCP servers %s; ignored",
+            ", ".join(sorted(unknown)),
+            ", ".join(sorted(by_name)),
+        )
+    return required
 
 
 def _get_mcp_tools(key: str, headers: HeadersProvider) -> list:
@@ -380,7 +400,7 @@ def _get_mcp_tools(key: str, headers: HeadersProvider) -> list:
         required = _required_mcp_urls()
         missing = required - pool.connected_urls
         if missing:
-            names = sorted(u.rsplit("/mcp/", 1)[-1] for u in missing)
+            names = sorted(_mcp_server_name(u) for u in missing)
             raise AgentNotReadyError(
                 "readiness gate: required MCP server(s) not connected: "
                 f"{', '.join(names)}; refusing autonomous remediation on an "

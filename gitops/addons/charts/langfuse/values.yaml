@@ -54,9 +54,11 @@ nextauthSecret: "changeme-generate-random-secret"
 # the salt on each sync and break the OTEL key auth), and the langfuse deployment (langfuse.yaml
 # -> langfuse-secrets/SALT) and the seed job (seed-job.yaml fast_hashed_secret_key) MUST read the
 # SAME value so the seeded fast-hash matches what Langfuse computes at ingestion time.
-# Override per-env with a secret value if desired; the fixed default below is fine for the
-# workshop/demo platform (the OTEL key is internal, not a production credential).
-salt: "peeks-langfuse-otel-salt-v1"
+# In production you MUST override this with a unique, secret per-env value — do not ship the
+# shared default below. It is deterministic by design and acceptable only for the workshop/demo
+# platform (the OTEL key is internal, not a production credential). Changing the value re-hashes
+# the API key, so the seed job and the langfuse deployment must be re-rendered together.
+salt: "langfuse-otel-salt-v1"
 
 resources:
   requests:
