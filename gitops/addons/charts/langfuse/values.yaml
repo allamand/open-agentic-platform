@@ -8,6 +8,9 @@ global:
   # to name the OTEL SM secret <resourcePrefix>-hub/langfuse-otel so two events with
   # different prefixes in one AWS account don't collide. Set from the registry entry's
   # valuesObject.global.resourcePrefix (cluster-secret resource_prefix annotation).
+  # Left empty here on purpose: the templates guard it via the "langfuse.resourcePrefix"
+  # helper, so a missing annotation FAILS the render instead of silently producing
+  # "-hub/langfuse-otel".
   resourcePrefix: ""
 
 clusterName: ""

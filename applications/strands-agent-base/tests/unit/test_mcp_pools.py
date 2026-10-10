@@ -1,10 +1,13 @@
-"""Unit tests for per-caller MCP connection pooling.
+"""Unit tests for per-caller MCP connection pooling and the /ready probe.
 
-The behaviour under test is isolation: an MCP connection binds its credential
-when it opens, so two callers must never share one.
+Two behaviours under test:
+  * isolation — an MCP connection binds its credential when it opens, so two
+    callers must never share one;
+  * readiness — connecting is a single non-blocking attempt that never raises;
+    recovery from a not-yet-ready backend is delegated to the /ready probe
+    (mcp_readiness), which reconnects missing servers until the toolset is
+    complete.
 """
-
-import threading
 
 import pytest
 
@@ -13,30 +16,10 @@ from app.config import config
 from app.identity import WORKLOAD_KEY, inbound_auth, outbound
 
 
-def _join_warmups(timeout: float = 5.0) -> None:
-    """Wait for any background MCP warm-up threads spawned by _open to finish."""
-    for t in threading.enumerate():
-        if t.name.startswith("mcp-warmup-"):
-            t.join(timeout)
-
-
-class _FakeResponse:
-    """Minimal stand-in for an httpx.Response, carrying only .status_code —
-    enough to drive the app's response event hook in tests."""
-
-    def __init__(self, status_code: int):
-        self.status_code = status_code
-
-
 @pytest.fixture(autouse=True)
 def isolated_agent_state(monkeypatch, tmp_path):
     """Fake MCP transport, one configured server, and empty pools per test."""
     transport_calls: list = []
-    # Tests may set control["fire_status"] = <int> to make the fake transport
-    # drive the app's real httpx response hook with that HTTP status, mirroring
-    # how the live gateway surfaces a status (the MCP stack then wraps the
-    # failure into an opaque error carrying no status).
-    control: dict = {}
 
     def fake_transport(url, http_client=None):
         raw = dict(getattr(http_client, "headers", None) or {})
@@ -44,13 +27,6 @@ def isolated_agent_state(monkeypatch, tmp_path):
         # to "Authorization" (matching identity.py's own header construction).
         headers = {"Authorization": raw["authorization"]} if "authorization" in raw else {}
         transport_calls.append((url, headers))
-        fire = control.get("fire_status")
-        if fire is not None and http_client is not None:
-            import asyncio
-
-            response = _FakeResponse(fire)
-            for hook in (getattr(http_client, "event_hooks", None) or {}).get("response", []):
-                asyncio.run(hook(response))
         return object()
 
     class FakeClient:
@@ -77,15 +53,13 @@ def isolated_agent_state(monkeypatch, tmp_path):
     monkeypatch.setattr(agent_mod, "MCPClient", FakeClient)
     monkeypatch.setattr(config, "MCP_SERVER_NAMES_RAW", "mcp-time")
     monkeypatch.setattr(agent_mod, "_pools", {})
-    # Keep the warm-up retry exercised but instant (cap every sleep at 0).
-    monkeypatch.setattr(agent_mod, "_MCP_WARMUP_MAX_WAIT", 0)
 
     sa = tmp_path / "token"
     sa.write_text("sa-token-v1")
     monkeypatch.setenv("WORKLOAD_TOKEN_PATH", str(sa))
 
     token = inbound_auth.set(None)
-    yield {"calls": transport_calls, "clients": FakeClient, "sa": sa, "control": control}
+    yield {"calls": transport_calls, "clients": FakeClient, "sa": sa}
     inbound_auth.reset(token)
 
 
@@ -198,8 +172,10 @@ def test_shutdown_closes_every_pool(isolated_agent_state):
     assert all(c.stops == 1 for c in isolated_agent_state["clients"].instances)
 
 
-def test_connect_failure_is_contained(monkeypatch, isolated_agent_state):
-    monkeypatch.setattr(agent_mod, "_MCP_WARMUP_MAX_ATTEMPTS", 2)
+def test_connect_failure_is_contained_without_blocking_or_raising(monkeypatch, isolated_agent_state):
+    """A down backend must NOT block, retry in-process, or raise: _open makes
+    exactly ONE fast attempt, the agent gets no tools from it and does not fail;
+    recovery is left to the /ready probe (see the readiness test below)."""
 
     class Failing(isolated_agent_state["clients"]):
         def start(self):
@@ -208,25 +184,26 @@ def test_connect_failure_is_contained(monkeypatch, isolated_agent_state):
 
     monkeypatch.setattr(agent_mod, "MCPClient", Failing)
     _, tools = _tools_for("Bearer alice.jwt")
-    _join_warmups()
 
-    # The synchronous connect makes exactly ONE fast attempt (never blocking the
-    # event loop on a down server), the agent gets no tools from it and does NOT
-    # raise; a bounded background warm-up then retries to its budget and gives up.
     assert tools == []
     instances = isolated_agent_state["clients"].instances
-    assert len(instances) == 1 + 2, "1 synchronous attempt + 2 background attempts"
-    assert all(c.stops == 1 for c in instances), (
-        "each failed attempt closes its half-started client"
-    )
+    assert len(instances) == 1, "exactly one synchronous attempt, no background retry"
+    assert instances[0].stops == 1, "the half-started client is closed"
 
 
-def test_connect_retries_in_background_through_transient_failure(monkeypatch, isolated_agent_state):
-    """A first-boot warm-up race (gateway 500 before the backend is Ready) must
-    self-resolve WITHOUT blocking: the synchronous connect makes one fast
-    attempt, then a background warm-up retries until the backend is Ready and
-    adds its tools to the pool — no cached half-blind pool needing a restart."""
-    monkeypatch.setattr(agent_mod, "_MCP_WARMUP_MAX_ATTEMPTS", 5)
+# ── /ready probe (mcp_readiness) ──────────────────────────────────────────
+
+def test_ready_is_true_when_no_servers_are_configured(monkeypatch, isolated_agent_state):
+    monkeypatch.setattr(config, "MCP_SERVER_NAMES_RAW", None)
+    ready, reasons = agent_mod.mcp_readiness()
+    assert ready is True and reasons == {}
+
+
+def test_ready_reconnects_until_the_toolset_is_complete(monkeypatch, isolated_agent_state):
+    """Mikhail's case: the first connect fails with a transient 404 (gateway
+    route not registered yet) and a later probe succeeds. The readiness probe
+    must report not-ready first (503 body names the server) then ready, with the
+    tools attached to the workload pool — no in-process retry/warm-up involved."""
 
     class FlakyThenOk(isolated_agent_state["clients"]):
         attempts = 0
@@ -234,99 +211,34 @@ def test_connect_retries_in_background_through_transient_failure(monkeypatch, is
         def start(self):
             super().start()
             FlakyThenOk.attempts += 1
-            if FlakyThenOk.attempts < 3:  # fail twice, succeed on the 3rd
-                raise RuntimeError("gateway 500: backend warming up")
+            if FlakyThenOk.attempts < 2:  # first probe 404s, second serves
+                raise RuntimeError("gateway 404: route not registered yet")
 
     monkeypatch.setattr(agent_mod, "MCPClient", FlakyThenOk)
-    key, _ = _tools_for("Bearer alice.jwt")
-    _join_warmups()
 
-    assert FlakyThenOk.attempts == 3, "one fast sync attempt, then background retries until Ready"
-    assert agent_mod._pools[key].tools, "tools added to the pool once the backend came up"
+    # First probe: the single configured server is down -> not ready, named.
+    ready, reasons = agent_mod.mcp_readiness()
+    assert ready is False
+    assert "mcp-time" in reasons and "404" in reasons["mcp-time"]
+    key = WORKLOAD_KEY
+    assert agent_mod._pools[key].tools == [], "no tools until the server is up"
+
+    # Second probe: the backend now serves -> ready, tools attached.
+    ready, reasons = agent_mod.mcp_readiness()
+    assert ready is True and reasons == {}
+    assert agent_mod._pools[key].tools, "tools attached to the workload pool once up"
     assert len(agent_mod._pools[key].clients) == 1, "exactly one live client pooled"
+    assert FlakyThenOk.attempts == 2, "one failed attempt, then one that succeeded"
 
 
-def test_a_non_retryable_connect_error_is_not_warmed_up(monkeypatch, isolated_agent_state):
-    """401/403/404 will not fix themselves by waiting, so no background warm-up
-    is spawned: exactly one synchronous attempt, then the server is dropped.
+def test_ready_reuses_the_workload_pool_the_autonomous_path_reads(isolated_agent_state):
+    """The probe populates the WORKLOAD pool, so a subsequent autonomous
+    (workload-keyed) _get_mcp_tools reuses it without reconnecting."""
+    ready, _ = agent_mod.mcp_readiness()
+    assert ready is True
+    calls_after_probe = len(isolated_agent_state["calls"])
 
-    The status is observed through the real httpx *response* event hook the app
-    attaches to the transport's client — mirroring how the live MCP stack
-    surfaces it — not a fabricated exception shape. The live SDK wraps a
-    transport failure into an opaque MCPError(-32603) with no HTTP status, so
-    the raised error here is deliberately opaque; only the hook carries 401."""
-    monkeypatch.setattr(agent_mod, "_MCP_WARMUP_MAX_ATTEMPTS", 5)
-    isolated_agent_state["control"]["fire_status"] = 401
-
-    class Unauthorized(isolated_agent_state["clients"]):
-        def start(self):
-            super().start()  # drives the response hook (401) via fake_transport
-            raise RuntimeError("MCP initialize failed")  # opaque, no HTTP status
-
-    monkeypatch.setattr(agent_mod, "MCPClient", Unauthorized)
-    _, tools = _tools_for("Bearer alice.jwt")
-    _join_warmups()
-
-    assert tools == []
-    assert len(isolated_agent_state["clients"].instances) == 1, "no background retry on 401/403/404"
-
-
-def test_a_retryable_http_status_still_warms_up(monkeypatch, isolated_agent_state):
-    """A 5xx observed via the hook is transient (gateway up before the backend
-    Deployment is Ready), so the background warm-up still runs — only 401/403/404
-    are treated as non-retryable. Guards against the hook over-classifying."""
-    monkeypatch.setattr(agent_mod, "_MCP_WARMUP_MAX_ATTEMPTS", 2)
-    isolated_agent_state["control"]["fire_status"] = 503
-
-    class ServerError(isolated_agent_state["clients"]):
-        def start(self):
-            super().start()  # drives the response hook (503) via fake_transport
-            raise RuntimeError("gateway 503: backend warming up")
-
-    monkeypatch.setattr(agent_mod, "MCPClient", ServerError)
-    _, tools = _tools_for("Bearer alice.jwt")
-    _join_warmups()
-
-    assert tools == []
-    assert len(isolated_agent_state["clients"].instances) == 1 + 2, (
-        "1 synchronous attempt + 2 background attempts (503 is retryable)"
-    )
-
-
-def test_readiness_gate_refuses_autonomous_on_incomplete_toolset(monkeypatch, isolated_agent_state):
-    """§7.1: the autonomous (workload) path must refuse to act when a required MCP
-    server is not connected, rather than open a remediation MR half-blind."""
-    monkeypatch.setattr(agent_mod, "_MCP_WARMUP_MAX_ATTEMPTS", 1)
-
-    class Failing(isolated_agent_state["clients"]):
-        def start(self):
-            super().start()
-            raise RuntimeError("connect refused")
-
-    monkeypatch.setattr(agent_mod, "MCPClient", Failing)
-    with pytest.raises(agent_mod.AgentNotReadyError):
-        _tools_for(None)  # None caller -> WORKLOAD_KEY (autonomous path)
-    _join_warmups()
-
-
-def test_readiness_gate_does_not_block_chat_on_incomplete_toolset(monkeypatch, isolated_agent_state):
-    """Chat (caller-keyed) pools are NOT gated: an incomplete toolset degrades
-    gracefully (empty tools) instead of refusing."""
-    monkeypatch.setattr(agent_mod, "_MCP_WARMUP_MAX_ATTEMPTS", 1)
-
-    class Failing(isolated_agent_state["clients"]):
-        def start(self):
-            super().start()
-            raise RuntimeError("connect refused")
-
-    monkeypatch.setattr(agent_mod, "MCPClient", Failing)
-    _, tools = _tools_for("Bearer alice.jwt")  # caller key, not workload
-    _join_warmups()
-    assert tools == []
-
-
-def test_readiness_gate_passes_when_all_required_connected(isolated_agent_state):
-    """When every required server is connected, the workload path returns tools."""
-    key, tools = _tools_for(None)  # WORKLOAD_KEY, single server connects OK
+    key, tools = _tools_for(None)  # None caller -> WORKLOAD_KEY
     assert key == WORKLOAD_KEY
-    assert tools, "all required servers connected -> tools returned, no refusal"
+    assert tools, "autonomous path sees the probe-connected tools"
+    assert len(isolated_agent_state["calls"]) == calls_after_probe, "no reconnect"

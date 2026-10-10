@@ -89,10 +89,11 @@ class _McpPool:
         self.clients: list = []
         self.tools: list = []
         # URLs that successfully connected (populated by _build_client). The
-        # readiness gate (§7.1) checks this against the required set.
+        # /ready probe (mcp_readiness) checks this against the configured set.
         self.connected_urls: set = set()
         self.connected_at: float = 0.0
-        # Guards clients/tools mutation from background warm-up threads (_open).
+        # Guards clients/tools mutation (the /ready probe thread may run
+        # concurrently with the request path).
         self.lock = threading.Lock()
 
 
@@ -149,50 +150,15 @@ def _detached_otel_context():
         _otel_context.detach(token)
 
 
-# On a fresh cluster the agent pod can become Ready before an MCP backend (or
-# its agentgateway route) is — the connect then fails one-shot (typically a
-# transient HTTP 500 from the gateway before the backend Deployment is Ready).
-# We must NOT retry that synchronously: _open runs at startup AND in the request
-# path (via _get_mcp_tools), so a blocking retry would freeze the asyncio event
-# loop — the liveness/health probe and every other caller with it — for the
-# whole budget, and one unreachable server could crash-loop the pod. Instead the
-# connect makes ONE fast attempt; if a server is merely warming up (a retryable
-# error — not 401/403/404), a bounded background thread keeps trying and adds its
-# tools to the pool once it comes up. The agent starts promptly with whatever
-# tools are ready and heals as backends appear, never blocking startup/requests.
-_MCP_WARMUP_MAX_ATTEMPTS = int(os.getenv("MCP_CONNECT_MAX_ATTEMPTS", "12"))
-_MCP_WARMUP_MAX_WAIT = int(os.getenv("MCP_CONNECT_MAX_WAIT", "30"))
-
-
-# HTTP statuses whose connect failures a warm-up retry must NOT repeat.
-_NO_RETRY_STATUSES = frozenset({401, 403, 404})
-
-
-class _NonRetryableConnectError(Exception):
-    """An MCP connect that must NOT be retried (gateway returned 401/403/404).
-
-    Auth/not-found failures do not fix themselves by waiting, so a warm-up
-    retry would just burn a background thread. _build_client raises this when
-    its httpx response hook observed such a status for the attempt; it carries
-    the status for logging and chains the underlying transport error as cause.
-    """
-
-    def __init__(self, status: int):
-        super().__init__(f"non-retryable MCP connect (HTTP {status})")
-        self.status = status
-
-
-def _no_retry_error(exc: BaseException) -> bool:
-    """True for a connect error a warm-up retry must NOT repeat.
-
-    The live MCP stack wraps a transport failure into an opaque
-    MCPError(-32603) that carries no HTTP status, so the status cannot be
-    recovered by walking the exception chain. Instead _build_client observes
-    the raw HTTP response via an httpx event hook and re-raises as
-    _NonRetryableConnectError when the gateway returned 401/403/404 — this
-    predicate simply recognises that marker.
-    """
-    return isinstance(exc, _NonRetryableConnectError)
+# Connecting to an MCP server can fail transiently on a fresh cluster: the pod
+# can be scheduled before a backend Deployment or its agentgateway route is
+# Ready (commonly a 404 for a route not registered yet, or a 500/503 from the
+# gateway). We do NOT retry in-process — _open makes ONE fast attempt per server
+# and never raises, so neither startup nor the request path ever blocks. Recovery
+# is delegated to Kubernetes via the /ready probe (see mcp_readiness): it
+# reconnects any not-yet-connected server every periodSeconds and the pod stays
+# out of the Service until its full toolset is up. A 404 is therefore just
+# retried on the next probe instead of being treated as permanent.
 
 
 def _build_client(pool: "_McpPool", url: str) -> MCPClient:
@@ -200,33 +166,14 @@ def _build_client(pool: "_McpPool", url: str) -> MCPClient:
 
     Runs under a detached OTEL context so the transport's background loop does
     not capture the active request span (see _detached_otel_context). On any
-    failure the half-started client is closed so nothing leaks. The real HTTP
-    status is observed via an httpx *response* event hook attached to the
-    transport's client — the MCP stack otherwise wraps a 401/403/404 into an
-    opaque MCPError(-32603) with no status, so this hook is the only reliable
-    place to see it before it is swallowed. If the gateway returned a
-    non-retryable status, the error is re-raised as _NonRetryableConnectError
-    so the caller skips the background warm-up. The pool lock guards the
-    clients/tools mutation against concurrent warm-up threads.
+    failure the half-started client is closed so nothing leaks and the error is
+    re-raised, so the caller can act on it: _open logs it and moves on;
+    mcp_readiness reports it in the /ready 503 body. The pool lock guards the
+    clients/tools mutation against the /ready probe thread running concurrently
+    with the request path.
     """
-    seen_status: dict = {}
-
-    async def _record_status(response) -> None:
-        # Observational only: record the first auth/not-found status so the
-        # connect-failure handler can classify it. Must never raise.
-        try:
-            code = getattr(response, "status_code", None)
-            if code in _NO_RETRY_STATUSES and "status" not in seen_status:
-                seen_status["status"] = code
-        except Exception:
-            pass
-
     def _transport(u=url, p=pool):
         http_client = create_mcp_http_client(headers=p.headers())
-        # Append our hook (do not clobber any the SDK may have registered).
-        hooks = dict(getattr(http_client, "event_hooks", {}) or {})
-        hooks["response"] = [*hooks.get("response", []), _record_status]
-        http_client.event_hooks = hooks
         return streamable_http_client(u, http_client=http_client)
 
     client = MCPClient(_transport)
@@ -234,15 +181,12 @@ def _build_client(pool: "_McpPool", url: str) -> MCPClient:
         with _detached_otel_context():
             client.start()
             server_tools = client.list_tools_sync()
-    except Exception as exc:
+    except Exception:
         try:
             with _detached_otel_context():
                 client.stop(None, None, None)
         except Exception:
             pass
-        status = seen_status.get("status")
-        if status is not None:
-            raise _NonRetryableConnectError(status) from exc
         raise
     with pool.lock:
         pool.clients.append(client)
@@ -252,47 +196,17 @@ def _build_client(pool: "_McpPool", url: str) -> MCPClient:
     return client
 
 
-def _warm_up_later(pool: "_McpPool", url: str) -> None:
-    """Retry a not-yet-ready MCP server in a background daemon thread.
-
-    Bounded exponential backoff; stops on success, on a non-retryable error
-    (401/403/404), or when the budget is exhausted. Tools added here are seen by
-    agents created after the server comes up (existing agents keep the tool set
-    they were built with). Never runs on the startup or request path.
-    """
-
-    def _run() -> None:
-        delay = 1.0
-        for attempt in range(1, _MCP_WARMUP_MAX_ATTEMPTS + 1):
-            time.sleep(min(delay, _MCP_WARMUP_MAX_WAIT))
-            try:
-                _build_client(pool, url)
-                logger.info(f"MCP server {url} came up (background attempt {attempt})")
-                return
-            except Exception as exc:
-                if _no_retry_error(exc):
-                    logger.warning(f"  Giving up on MCP server {url} (non-retryable): {exc}")
-                    return
-                logger.warning(f"  MCP server {url} still unavailable (attempt {attempt}): {exc}")
-                delay *= 2
-        logger.warning(
-            f"  MCP server {url} did not come up after {_MCP_WARMUP_MAX_ATTEMPTS} background attempts"
-        )
-
-    threading.Thread(target=_run, name=f"mcp-warmup-{url}", daemon=True).start()
-
-
 def _open(pool: "_McpPool", urls: list) -> None:
+    """Connect every configured MCP server once. Never raises and never blocks:
+    a server that isn't up yet is left unconnected and recovered later by the
+    /ready probe (mcp_readiness), which keeps the pod out of the Service until
+    the toolset is complete."""
     for url in urls:
         logger.info(f"Connecting to MCP server: {url}")
         try:
             _build_client(pool, url)  # one fast attempt — never blocks
         except Exception as exc:
-            if _no_retry_error(exc):
-                logger.warning(f"  Failed to connect to MCP server {url} (non-retryable): {exc}")
-            else:
-                logger.warning(f"  MCP server {url} not ready, warming up in background: {exc}")
-                _warm_up_later(pool, url)
+            logger.warning(f"  MCP server {url} not ready (will retry via /ready probe): {exc}")
     pool.connected_at = time.monotonic()
 
 
@@ -308,50 +222,67 @@ def _close(pool: _McpPool) -> None:
     pool.clients = []
 
 
-# Readiness gate (§7.1): when enabled, the AUTONOMOUS (workload) path refuses to
-# act unless every REQUIRED MCP server is connected — the agent must not open a
-# remediation MR on an incomplete toolset (half-blind RCA). Chat is never gated
-# (it degrades gracefully). Disable with MCP_READINESS_GATE=false.
-_MCP_READINESS_GATE = os.getenv("MCP_READINESS_GATE", "true").lower() not in ("0", "false", "no")
-
-
-class AgentNotReadyError(RuntimeError):
-    """The readiness gate refused: the autonomous path's required MCP servers are
-    not all connected, so the agent declines to produce remediation on an
-    incomplete toolset. Transient — the incident's SQS redelivery retries once the
-    backends warm up (the one-shot connect + background warm-up heal the pool)."""
+# Completeness of the autonomous (workload) toolset is enforced by Kubernetes,
+# not in code: the /ready probe (mcp_readiness) keeps the pod out of the Service
+# until every configured MCP server is connected on the workload pool, so an
+# autonomous request (delivered to the Service by the incident-bridge) only ever
+# reaches a pod whose toolset is complete. Chat (caller-keyed) pools degrade
+# gracefully. No in-code readiness gate is needed.
 
 
 def _mcp_server_name(url: str) -> str:
     """Canonical server name for an MCP URL: the segment after '/mcp/' when present,
-    else the last non-empty path segment. Robust to URLs not shaped as /mcp/<name>."""
+    else the last non-empty path segment. Used to name a server in the /ready 503
+    body (e.g. "gitlab-mcp"). Robust to URLs not shaped as /mcp/<name>."""
     path = url.rstrip("/")
     if "/mcp/" in path:
         return path.rsplit("/mcp/", 1)[-1]
     return path.rsplit("/", 1)[-1]
 
 
-def _required_mcp_urls() -> set:
-    """URLs the autonomous (workload) path requires before it may act. Default:
-    every configured MCP server (strict — refuse on an incomplete toolset).
-    Override with MCP_REQUIRED_SERVERS (comma-separated server names) to require
-    only a subset (e.g. just the gitlab + eks-read servers)."""
-    all_urls = list(config.MCP_SERVER_URLS)
-    names = [n.strip() for n in os.getenv("MCP_REQUIRED_SERVERS", "").split(",") if n.strip()]
-    if not names:
-        return set(all_urls)
-    by_name = {_mcp_server_name(u): u for u in all_urls}
-    required = {by_name[n] for n in names if n in by_name}
-    unknown = [n for n in names if n not in by_name]
-    if unknown:
-        # A requested name that matches no configured server would otherwise be
-        # silently dropped from the required set, quietly weakening the gate — warn.
-        logger.warning(
-            "MCP_REQUIRED_SERVERS name(s) %s not among configured MCP servers %s; ignored",
-            ", ".join(sorted(unknown)),
-            ", ".join(sorted(by_name)),
-        )
-    return required
+# Serialises the /ready probe's connect attempts: the kubelet calls /ready every
+# periodSeconds and FastAPI runs the sync endpoint in a worker thread, so this
+# keeps two overlapping probes from racing to build the same workload pool.
+_readiness_lock = threading.Lock()
+
+
+def _short_reason(exc: BaseException) -> str:
+    """One-line failure reason for the /ready 503 body (first line, truncated)."""
+    text = str(exc).strip()
+    first = text.splitlines()[0] if text else exc.__class__.__name__
+    return first[:200]
+
+
+def mcp_readiness() -> tuple[bool, dict]:
+    """Ensure the WORKLOAD MCP pool is fully connected, retrying missing servers.
+
+    Called by the /ready endpoint. For every configured MCP server not yet
+    connected on the workload pool — the same pool the autonomous path reuses —
+    this makes one connect attempt now, so a Ready pod has the complete toolset.
+    Returns ``(ready, reasons)`` where *ready* is True iff every configured
+    server is connected and *reasons* maps each still-missing server name to a
+    short cause for the 503 body (e.g. ``{"gitlab-mcp": "..."}``). Blocking is
+    fine: the endpoint is a sync ``def`` that FastAPI runs off the event loop.
+    """
+    urls = list(config.MCP_SERVER_URLS)
+    if not urls:
+        return True, {}
+    with _readiness_lock:
+        headers, key = outbound(False)  # workload creds; no caller on the probe
+        pool = _pools.get(key)
+        if pool is None:
+            pool = _McpPool(headers)
+            pool.connected_at = time.monotonic()
+            _pools[key] = pool
+        reasons: dict = {}
+        for url in urls:
+            if url in pool.connected_urls:
+                continue
+            try:
+                _build_client(pool, url)
+            except Exception as exc:
+                reasons[_mcp_server_name(url)] = _short_reason(exc)
+        return (not reasons), reasons
 
 
 def _get_mcp_tools(key: str, headers: HeadersProvider) -> list:
@@ -392,21 +323,10 @@ def _get_mcp_tools(key: str, headers: HeadersProvider) -> list:
         logger.info("Closing least recently used MCP pool (max %d)", _MAX_MCP_POOLS)
         _close(_pools.pop(next(iter(_pools))))
 
-    # Readiness gate (§7.1): the AUTONOMOUS (workload) path must not act on an
-    # incomplete toolset. If a required MCP server never connected (still warming
-    # up or genuinely down), refuse — do NOT open a remediation MR half-blind.
-    # Caller (chat) pools are intentionally not gated.
-    if _MCP_READINESS_GATE and key == WORKLOAD_KEY:
-        required = _required_mcp_urls()
-        missing = required - pool.connected_urls
-        if missing:
-            names = sorted(_mcp_server_name(u) for u in missing)
-            raise AgentNotReadyError(
-                "readiness gate: required MCP server(s) not connected: "
-                f"{', '.join(names)}; refusing autonomous remediation on an "
-                f"incomplete toolset (connected {len(pool.connected_urls)}/{len(required)})"
-            )
-
+    # Completeness of the autonomous toolset is enforced by Kubernetes, not here:
+    # the /ready probe (mcp_readiness) keeps the pod out of the Service until the
+    # workload pool has every configured server, so an autonomous request only
+    # reaches a pod whose toolset is complete. Chat pools degrade gracefully.
     return pool.tools
 
 

@@ -7,9 +7,10 @@ from contextlib import asynccontextmanager
 from typing import Any, Dict
 
 import uvicorn
+from fastapi.responses import JSONResponse
 from strands.multiagent.a2a import A2AServer
 
-from .agent import create_agent, get_or_create_agent, shutdown_mcp
+from .agent import create_agent, get_or_create_agent, mcp_readiness, shutdown_mcp
 from .config import config
 from .identity import capture_caller_auth
 
@@ -191,6 +192,25 @@ async def health() -> Dict[str, str]:
         "agent": config.AGENT_NAME,
         "a2a_protocol": "compatible",
     }
+
+
+# Deliberately a plain `def`, not `async def`: mcp_readiness opens MCP
+# connections, which blocks. FastAPI runs sync endpoints in a worker thread, so
+# the blocking connect never stalls the asyncio event loop (an `async def` here
+# would). The Kubernetes readiness probe calls this every periodSeconds; while
+# any configured MCP server is not connected it retries the missing ones (one
+# attempt per probe) and returns 503, so the pod is kept out of the Service
+# until its toolset is complete. /health stays always-200 for liveness, so a
+# transiently-not-ready pod is not restarted — only kept un-Ready.
+@app.get("/ready")
+def ready():
+    ok, reasons = mcp_readiness()
+    if ok:
+        return {"status": "ready", "agent": config.AGENT_NAME}
+    return JSONResponse(
+        status_code=503,
+        content={"status": "not-ready", "agent": config.AGENT_NAME, "missing": reasons},
+    )
 
 
 @app.post("/chat")
