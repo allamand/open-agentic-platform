@@ -61,7 +61,9 @@ clusters:
     # a `sandbox: true` agent, and then leaves its pod Pending forever: the isolation
     # is requested and never delivered. Nitro Sandboxes require 1.36+ in a US
     # commercial region. So staying on 1.35 is not a neutral choice either.
-    k8sVersion: "1.37"
+    # TEST BRANCH ONLY (PR #164 live test): kept at 1.35 so an already-live oap-dev
+    # is not pushed two minors in one call. Do not merge.
+    k8sVersion: "1.35"
     # accountId/managementAccountId deliberately OMITTED. appmod-blueprints'
     # kro-clusters chart resolves both via `default $.Values.global.accountId`
     # (clusters.yaml), and clusters-kro.yaml's ApplicationSet template already
